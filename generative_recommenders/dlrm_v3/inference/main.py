@@ -69,6 +69,8 @@ SUPPORTED_CONFIGS = {
     "debug": "debug.gin",
     "kuairand-1k": "kuairand_1k.gin",
     "movielens-13b": "movielens_13b.gin",
+    "movielens-1m": "movielens_1m.gin",
+    "movielens-20m": "movielens_20m.gin",
 }
 
 
@@ -201,6 +203,52 @@ def add_results(
     )
 
 
+def _print_embedding_sizes(model_family, table_config) -> None:
+    """打印 embedding 配置和从 model 中能检测到的 Embedding 模块的规模。"""
+    try:
+        logger.info("Embedding table config:")
+        try:
+            logger.info(json.dumps(table_config, indent=2, default=str))
+        except Exception:
+            logger.info(str(table_config))
+    except Exception:
+        logger.exception("无法打印 table_config")
+
+    # 尝试从 model_family 常见属性中查看 embedding 信息
+    attrs = ["embeddings", "embedding_tables", "embedding_table", "emb_table", "sparse_embeddings"]
+    for attr in attrs:
+        if hasattr(model_family, attr):
+            try:
+                emb_obj = getattr(model_family, attr)
+                if isinstance(emb_obj, (list, tuple)):
+                    for i, e in enumerate(emb_obj):
+                        if hasattr(e, "weight"):
+                            logger.info("%s[%d] weight shape: %s", attr, i, tuple(e.weight.shape))
+                        elif hasattr(e, "num_embeddings"):
+                            logger.info("%s[%d] num_embeddings=%s, embedding_dim=%s", attr, i, getattr(e, "num_embeddings", None), getattr(e, "embedding_dim", None))
+                        else:
+                            logger.info("%s[%d] type=%s", attr, i, type(e))
+                else:
+                    if hasattr(emb_obj, "weight"):
+                        logger.info("%s weight shape: %s", attr, tuple(emb_obj.weight.shape))
+                    elif hasattr(emb_obj, "num_embeddings"):
+                        logger.info("%s num_embeddings=%s, embedding_dim=%s", attr, getattr(emb_obj, "num_embeddings", None), getattr(emb_obj, "embedding_dim", None))
+                    else:
+                        logger.info("%s type=%s", attr, type(emb_obj))
+            except Exception:
+                logger.exception("检查 %s 时出错", attr)
+
+    # 如果 model_family 包含 .model 属性，遍历其模块并打印 torch.nn.Embedding
+    try:
+        model_obj = getattr(model_family, "model", None)
+        if model_obj is not None:
+            for name, module in model_obj.named_modules():
+                if isinstance(module, torch.nn.Embedding):
+                    logger.info("module %s: num_embeddings=%s, embedding_dim=%s", name, module.num_embeddings, module.embedding_dim)
+    except Exception:
+        logger.exception("遍历 model 时出错")
+
+
 @gin.configurable
 def run(
     dataset: str = "debug",
@@ -224,11 +272,13 @@ def run(
     numpy_rand_seed: int = 123,
     dev_mode: bool = False,
     dataset_percentage: float = 1.0,
+    torch_random_seed: int = 42,
 ) -> None:
     set_dev_mode(dev_mode)
     if scenario_name not in SCENARIO_MAP:
         raise NotImplementedError("valid scanarios:" + str(list(SCENARIO_MAP.keys())))
     np.random.seed(numpy_rand_seed)
+    # torch.manual_seed(torch_random_seed)
 
     hstu_config = get_hstu_configs(dataset)
     table_config = get_embedding_table_config(dataset)
@@ -248,6 +298,12 @@ def run(
         **kwargs,
     )
     model_family.load(model_path)
+
+    # 新增：打印 embedding 规模
+    try:
+        _print_embedding_sizes(model_family, table_config)
+    except Exception:
+        logger.exception("打印 embedding 大小时出错")
 
     mlperf_conf = os.path.abspath(MLPERF_CONF)
     if not os.path.exists(mlperf_conf):

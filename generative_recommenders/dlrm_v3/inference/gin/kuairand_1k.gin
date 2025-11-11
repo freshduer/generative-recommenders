@@ -17,4 +17,4 @@ run.num_queries = 10000
 run.samples_per_query_multistream = 64
 run.max_num_samples = 2048
 run.numpy_rand_seed = 123
-run.new_path_prefix = "/home/linjianma"
+run.new_path_prefix = "/home/comp/cswjyu"

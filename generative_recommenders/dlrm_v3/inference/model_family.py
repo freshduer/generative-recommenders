@@ -22,6 +22,7 @@ import time
 import uuid
 from threading import Event
 from typing import Dict, List, Optional, Tuple, Union
+from collections import Counter
 
 import torch
 import torch.multiprocessing as mp
@@ -42,8 +43,15 @@ from torch import quantization as quant
 from torchrec.distributed.quant_embedding import QuantEmbeddingCollection
 from torchrec.modules.embedding_configs import EmbeddingConfig, QuantConfig
 from torchrec.test_utils import get_free_port
+import torch.distributed as dist
+from torchrec.distributed.model_parallel import DistributedModelParallel, get_default_sharders
+from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.comm import get_local_size
 
-
+import logging
+logging.basicConfig()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 class HSTUModelFamily:
     def __init__(
         self,
@@ -118,7 +126,7 @@ class ModelFamilySparseDist:
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.module: Optional[torch.nn.Module] = None
-
+    """
     def load(self, model_path: str) -> None:
         print(f"Loading sparse module from {model_path}")
 
@@ -142,6 +150,77 @@ class ModelFamilySparseDist:
             inplace=False,
         )
         print(f"sparse module is {self.module}")
+    """
+
+    def load(self, model_path: str) -> None:
+        logger.info(f"Loading sparse module from {model_path}")
+        # 如果只用单进程单卡，保持原逻辑
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size == 1:
+            sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
+                table_config=self.table_config,
+                hstu_config=self.hstu_config,
+            )
+            load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
+            sparse_arch.eval()
+            self.module = quant.quantize_dynamic(
+                sparse_arch,
+                qconfig_spec={
+                    torchrec.EmbeddingCollection: QuantConfig(
+                        activation=quant.PlaceholderObserver.with_args(dtype=torch.float),
+                        weight=quant.PlaceholderObserver.with_args(dtype=torch.int8),
+                    ),
+                },
+                mapping={
+                    torchrec.EmbeddingCollection: QuantEmbeddingCollection,
+                },
+                inplace=False,
+            )
+            print(f"sparse module is {self.module}")
+            return
+
+        # 多卡：用 DMP 对 _hstu_model 做分片（EmbeddingCollection -> ShardedEmbeddingCollection）
+        # 需要每卡一个进程初始化 PG，这里只展示单进程骨架，实战请仿照 DenseDist 的多进程结构
+        rank = int(os.environ.get("RANK", "0"))
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+        sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
+            table_config=self.table_config,
+            hstu_config=self.hstu_config,
+        )
+        # 先加载稀疏权重到原模型
+        load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
+        sparse_arch._hstu_model.eval()
+
+        # 生成分片 plan 并包 DMP（关键：传入整个模型，sharder 会找到 EmbeddingCollection 并替换为 ShardedEmbeddingCollection）
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                local_world_size=get_local_size(),
+                world_size=world_size,
+                compute_device="cuda",
+            )
+        )
+        plan = planner.collective_plan(
+            module=sparse_arch._hstu_model,  # DlrmHSTU
+            sharders=get_default_sharders(),
+            group=dist.group.WORLD,
+        )
+        sharded_hstu = DistributedModelParallel(
+            module=sparse_arch._hstu_model,
+            device=device,
+            plan=plan,
+        )
+        # 用分片后的 hstu 替换回稀疏模块
+        sparse_arch._hstu_model = sharded_hstu
+        sparse_arch = sparse_arch.to(device)
+        sparse_arch.eval()
+
+        # 如果需要量化，注意不要再把 EmbeddingCollection 映射成 QuantEmbeddingCollection（此时已是 ShardedEmbeddingCollection）
+        self.module = sparse_arch
+        print(f"sparse module is {self.module}")
 
     def predict(
         self, samples: Samples
@@ -157,6 +236,7 @@ class ModelFamilySparseDist:
             assert self.module is not None
             uih_features = samples.uih_features_kjt
             candidates_features = samples.candidates_features_kjt
+            t0 = time.perf_counter()
             (
                 seq_embeddings,
                 payload_features,
@@ -168,6 +248,8 @@ class ModelFamilySparseDist:
                 uih_features=uih_features,
                 candidates_features=candidates_features,
             )
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            logger.info(f"[sparse] forward took {dt_ms:.3f} ms")
             return (
                 seq_embeddings,
                 payload_features,
@@ -261,6 +343,7 @@ class ModelFamilyDenseDist:
                 assert profiler is not None
                 profiler.step()
             with torch.profiler.record_function("dense forward"):
+                t0 = time.perf_counter()
                 (
                     _,
                     _,
@@ -276,6 +359,8 @@ class ModelFamilyDenseDist:
                     max_num_candidates=max_num_candidates,
                     num_candidates=num_candidates,
                 )
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                logger.info(f"[dense][rank {rank}] forward took {dt_ms:.3f} ms")
                 assert mt_target_preds is not None
                 mt_target_preds = mt_target_preds.detach().to(
                     device="cpu", non_blocking=True
@@ -410,6 +495,7 @@ class ModelFamilyDenseSingleWorker:
             and seq_embeddings is not None
         )
         with torch.profiler.record_function("dense forward"):
+            t0 = time.perf_counter()
             seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
                 move_sparse_output_to_device(
                     seq_embeddings=seq_embeddings,
@@ -435,6 +521,8 @@ class ModelFamilyDenseSingleWorker:
                 max_num_candidates=max_num_candidates,
                 num_candidates=num_candidates,
             )
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            logger.info(f"[dense][single] forward took {dt_ms:.3f} ms")
             assert mt_target_preds is not None
             mt_target_preds = mt_target_preds.detach().to(
                 device="cpu", non_blocking=True

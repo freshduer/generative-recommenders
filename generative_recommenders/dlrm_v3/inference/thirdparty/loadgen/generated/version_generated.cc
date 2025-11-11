@@ -10,53 +10,37 @@ const std::string& LoadgenVersion() {
 }
 
 const std::string& LoadgenBuildDateLocal() {
-  static const std::string str = "2024-10-18T23:12:51.002440";
+  static const std::string str = "2025-11-07T10:33:46.358788";
   return str;
 }
 
 const std::string& LoadgenBuildDateUtc() {
-  static const std::string str = "2024-10-19T06:12:51.002446";
+  static const std::string str = "2025-11-07T02:33:46.358795";
   return str;
 }
 
 const std::string& LoadgenGitRevision() {
-  static const std::string str = "f5c8f17583";
+  static const std::string str = "NA";
   return str;
 }
 
 const std::string& LoadgenGitCommitDate() {
-  static const std::string str = "2024-10-08T18:30:16+01:00";
+  static const std::string str = "NA";
   return str;
 }
 
 const std::string& LoadgenGitStatus() {
-  static const std::string str = R"LGVG_RSLD()LGVG_RSLD";
+  static const std::string str = "NA";
   return str;
 }
 
 const std::string& LoadgenGitLog() {
-  static const std::string str = R"LGVG_RSLD(f5c8f1758374aeaba26b2e84d31690111cfdf054 Fix bug: Loadgen ignoring token latency targets in user conf (#1874)
-976bb1ad9c7946be79507f3ff67955c27426af52 Set correct remote repo (#1871)
-41fa8aadd1ba0ecc97f6a519d8b42b04278e5f24 Add format files github action (#1682)
-518b454fd8647bfbd23a074e875e87353f33393e Tflite tpu (#1449)
-e0fdec1c7a75c98cfc194f13d62ac4388d419c8a Fix link in GettingStarted.ipynb (#1512)
-92bd8198d15411d7fb7d7c27f8904bc5a0bcfe7a Fix warning in the submission checker (#1808)
-224cfbf5c0e82cae6d48620025b7e1258ae3666a Fix typo in reference datatype (#1851)
-3ef1249b7f50a250c02c568342e0aea6638fc5a7 Fix docs (#1853)
-a0874c100c54cbc54fb743ac8bf9fb5fadc64135 Update build_wheels.yml (#1758)
-6eff09986e337ccf03f675c9f244d8ee93644e16 Extend the final report generation script to output a json file of results (#1825)
-54f3f93a73cc8ca5e3319ad87fb325e510574f56 Add binding for server_num_issue_query_threads parameter (#1862)
-c4d0b3ea98e6fe7252e50cb573f0d523da7979df Update docs: SCC24,  fix broken redirect  (#1843)
-7d2f0c41e5cd79c9178702867392e38f57953338 Update DLRM readme (#1811)
-cf5fddc5d0746bf3820eb0ab7294bbf709d788ab Enable systems to be marked as power only (#1850)
-81c2de69de4af90410cd1ba000fc5bd731bf6dee Documentation updates (#1821)
-73b02798219c794a735a7f2ddabbc3df9173352d Fix error with generate_final_report.py when the input CSV file is empty (#1827))LGVG_RSLD";
+  static const std::string str = "NA";
   return str;
 }
 
 const std::string& LoadgenSha1OfFiles() {
   static const std::string str = R"LGVG_RSLD(012aad77e5206c89d50718c46c119d1f3cb056b2 /.clang-format
-e173f4513f3c5dac1f0bea1473bb0a058e23f190 /=42
 d5274ff0b56e8d3cdb273174628a4461fca6f02a /CMakeLists.txt
 20a55bb946c2c0bbb564ced2af1e48efd096b3a8 /README.md
 5f6c6a784e9cd6995db47f9b9f70b1769909c9d8 /README_BUILD.md
@@ -85,7 +69,7 @@ d82500c326c2de83db411f1146882aa4692b419c /results.h
 13c49b028b22749b5f3c44f3d9bb489e8c0574e9 /setup.py
 18d4809589dae33317d88d9beeb5491a6e1ccdec /system_under_test.h
 c15c3e150030089a8d634bd2ad6d4b644002e613 /test_settings.h
-e21febd60f9b5bedd1fc81bb990f09c34b32043c /test_settings_internal.cc
+cec5f3e99b2db7a79a376a4a3d3147d7ce9ad7d9 /test_settings_internal.cc
 f1d5335b53ca610c30e0edc5d07999a27b5b4b9a /test_settings_internal.h
 3df8fdabf6eaea4697cf25d1dcb89cae88e36efd /utils.cc
 40775e32d619ea6356826ae5ea4174c7911f6894 /utils.h

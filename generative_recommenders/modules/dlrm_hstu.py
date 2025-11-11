@@ -19,6 +19,7 @@
 
 import logging
 from dataclasses import dataclass, field
+import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -376,7 +377,10 @@ class DlrmHSTU(HammerModule):
                 dim=0,
             ),
         )
+        t0 = time.perf_counter()
         seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info(f"[sparse] embedding lookup took {dt_ms:.3f} ms")
         num_candidates = fx_mark_length_features(
             candidates_features.lengths().view(len(candidates_features.keys()), -1)
         )[0]
