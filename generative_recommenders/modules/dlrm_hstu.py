@@ -50,6 +50,8 @@ from torch.autograd.profiler import record_function
 from torchrec import KeyedJaggedTensor
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
+import torch.distributed as dist
+import os
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -126,19 +128,22 @@ class DlrmHSTU(HammerModule):
         is_inference: bool,
         is_dense: bool = False,
         bf16_training: bool = True,
+        embedding_collection: Optional[EmbeddingCollection] = None,
     ) -> None:
         super().__init__(is_inference=is_inference)
-        logger.info(f"Initialize HSTU module with configs {hstu_configs}")
+        self.rank = dist.get_rank()
+        logger.info(f"rank:{self.rank} Initialize HSTU module with configs {hstu_configs}")
         self._hstu_configs = hstu_configs
         self._bf16_training: bool = bf16_training
         set_static_max_seq_lens([self._hstu_configs.max_seq_len])
 
         if not is_dense:
-            self._embedding_collection: EmbeddingCollection = EmbeddingCollection(
-                tables=list(embedding_tables.values()),
-                need_indices=False,
-                device=torch.device("meta"),
-            )
+            # self._embedding_collection: EmbeddingCollection = EmbeddingCollection(
+            #     tables=list(embedding_tables.values()),
+            #     need_indices=False,
+            #     device=torch.device("meta"),
+            # )
+            self._embedding_collection = embedding_collection
 
         # multitask configs must be sorted by task types
         self._multitask_configs: List[TaskConfig] = hstu_configs.multitask_configs
@@ -377,10 +382,17 @@ class DlrmHSTU(HammerModule):
                 dim=0,
             ),
         )
+        logger.debug(f"process id:{os.getpid()} Keys: {merged_sparse_features.keys()}")
+        logger.debug(f"process id:{os.getpid()} Values device: {merged_sparse_features.values().device}, shape: {merged_sparse_features.values().shape}")
+        logger.debug(f"process id:{os.getpid()} Values sample: {merged_sparse_features.values()[:10]}")  # 打印前10个值
+        logger.debug(f"process id:{os.getpid()} Lengths device: {merged_sparse_features.lengths().device}, shape: {merged_sparse_features.lengths().shape}")
+        logger.debug(f"process id:{os.getpid()} Lengths sample: {merged_sparse_features.lengths()[:10]}")  # 打印前10个长度
+        logger.debug(f"process id:{os.getpid()} [sparse] rank:{self.rank} embedding lookup start")
+
         t0 = time.perf_counter()
         seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        logger.info(f"[sparse] embedding lookup took {dt_ms:.3f} ms")
+        t1 = time.perf_counter()
+        logger.info(f"[sparse] rank:{self.rank} embedding lookup done, time: {(t1 - t0) * 1000:.3f} ms")
         num_candidates = fx_mark_length_features(
             candidates_features.lengths().view(len(candidates_features.keys()), -1)
         )[0]
@@ -434,6 +446,8 @@ class DlrmHSTU(HammerModule):
             for k in self._hstu_configs.user_embedding_feature_names
             + self._hstu_configs.item_embedding_feature_names
         }
+        for k, v in seq_embeddings.items():
+            print(f"{k}: embedding.shape={v.embedding.shape}, lengths.shape={v.lengths.shape}")
 
         return (
             seq_embeddings,
@@ -483,11 +497,12 @@ class DlrmHSTU(HammerModule):
                         kernel=self.hammer_kernel(),
                     ),
                 )
-
         with record_function("## item_forward ##"):
             candidates_item_embeddings = self._item_forward(
                 seq_embeddings,
             )
+        logger.debug(f"[sparse]rank:{self.rank} _item_forward done")
+        
         with record_function("## user_forward ##"):
             candidates_user_embeddings = self._user_forward(
                 max_uih_len=max_uih_len,
@@ -496,6 +511,7 @@ class DlrmHSTU(HammerModule):
                 payload_features=payload_features,
                 num_candidates=num_candidates,
             )
+        logger.debug(f"[sparse]rank:{self.rank} user_forward done")
         with record_function("## multitask_module ##"):
             supervision_labels, supervision_weights = (
                 _get_supervision_labels_and_weights(
@@ -516,6 +532,7 @@ class DlrmHSTU(HammerModule):
                     supervision_weights=supervision_weights,
                 )
             )
+        logger.debug(f"[sparse]rank:{self.rank} multitask_module done")
 
         aux_losses: Dict[str, torch.Tensor] = {}
         if not self._is_inference and self.training:

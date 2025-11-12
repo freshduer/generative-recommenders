@@ -55,6 +55,14 @@ from generative_recommenders.dlrm_v3.utils import (
     SUPPORTED_DATASETS,
 )
 
+from torchrec.distributed.planner.types import ParameterConstraints
+from torchrec.distributed.types import (
+    ModuleSharder,
+    ShardingEnv,
+    ShardingPlan,
+    ShardingType,
+)
+import torch.distributed as dist
 
 logger: logging.Logger = logging.getLogger("main")
 
@@ -248,6 +256,22 @@ def _print_embedding_sizes(model_family, table_config) -> None:
     except Exception:
         logger.exception("遍历 model 时出错")
 
+def gen_constraints_from_table_config(
+    table_config: List,
+    sharding_type: ShardingType = ShardingType.TABLE_WISE,
+) -> Dict[str, ParameterConstraints]:
+    """
+    Generate sharding constraints dynamically from the given table_config.
+    Each table name will map to one ParameterConstraints object.
+    """
+    constraints = {}
+    for table in table_config:
+        # table.name comes from EmbeddingBagConfig(name=...)
+        logger.info(f"Generating constraint for table: {table}")
+        constraints[table] = ParameterConstraints(
+            sharding_types=[sharding_type.value]
+        )
+    return constraints
 
 @gin.configurable
 def run(
@@ -279,15 +303,37 @@ def run(
         raise NotImplementedError("valid scanarios:" + str(list(SCENARIO_MAP.keys())))
     np.random.seed(numpy_rand_seed)
     # torch.manual_seed(torch_random_seed)
+    dist.init_process_group(backend="nccl")
 
     hstu_config = get_hstu_configs(dataset)
     table_config = get_embedding_table_config(dataset)
     set_is_inference(is_inference=not compute_eval)
+    constraints=gen_constraints_from_table_config(
+        table_config,
+        # sharding_type=ShardingType.DATA_PARALLEL,
+        sharding_type=ShardingType.ROW_WISE,
+        # sharding_type=ShardingType.TABLE_WISE,
+    )
+    # 打印 constraints 概览与详细内容
+    try:
+        logger.info("Constraints 总数: %d", len(constraints))
+        logger.info("Constraints 表名列表: %s", list(constraints.keys()))
+        for name, pc in constraints.items():
+            logger.info(
+                "Constraint | table=%s | sharding_types=%s | compute_kernels=%s | pooling_factors=%s",
+                name,
+                getattr(pc, "sharding_types", None),
+                getattr(pc, "compute_kernels", None),
+                getattr(pc, "pooling_factors", None),
+            )
+    except Exception:
+        logger.exception("打印 constraints 失败")
 
     model_family = HSTUModelFamily(
         hstu_config=hstu_config,
         table_config=table_config,
         output_trace=output_trace,
+        constraints=constraints,
     )
     dataset, kwargs = get_dataset(dataset, new_path_prefix)
 
@@ -326,7 +372,7 @@ def run(
     # warmup
     warmup_ids = list(range(batchsize))
     ds.load_query_samples(warmup_ids)
-    for _ in range(5 * int(os.environ.get("WORLD_SIZE", 1))):
+    for _ in range(100 * int(os.environ.get("WORLD_SIZE", 1))):
         sample = ds.get_samples(warmup_ids)
         _ = model_family.predict(sample)
     ds.unload_query_samples(None)

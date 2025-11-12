@@ -42,6 +42,7 @@ def get_hstu_model(
     table_device: str = "meta",
     max_hash_size: Optional[int] = None,
     is_dense: bool = False,
+    embedding_collection: Optional[EmbeddingCollection] = None,
 ) -> DlrmHSTU:
     if max_hash_size is not None:
         for t in table_config.values():
@@ -53,14 +54,15 @@ def get_hstu_model(
         embedding_tables=table_config,
         is_inference=IS_INFERENCE,
         is_dense=is_dense,
+        embedding_collection=embedding_collection,
     )
     model.eval()
     model.recursive_setattr("_use_triton_cc", False)
-    for _, module in model.named_modules():
-        if isinstance(module, EmbeddingBagCollection) or isinstance(
-            module, EmbeddingCollection
-        ):
-            module.to_empty(device=table_device)
+    # for _, module in model.named_modules():
+    #     if isinstance(module, EmbeddingBagCollection) or isinstance(
+    #         module, EmbeddingCollection
+    #     ):
+    #         module.to_empty(device=table_device)
     return model
 
 
@@ -69,12 +71,14 @@ class HSTUSparseInferenceModule(torch.nn.Module):
         self,
         table_config,
         hstu_config: DlrmHSTUConfig,
+        embedding_collection: Optional[EmbeddingCollection] = None,
     ) -> None:
         super().__init__()
         self._hstu_model: DlrmHSTU = get_hstu_model(
             table_config,
             hstu_config,
-            table_device="cpu",
+            # table_device="cpu",
+            embedding_collection=embedding_collection,
         )
 
     def forward(

@@ -46,35 +46,98 @@ from torchrec.test_utils import get_free_port
 import torch.distributed as dist
 from torchrec.distributed.model_parallel import DistributedModelParallel, get_default_sharders
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.types import (
+    ModuleSharder,
+    ShardingEnv,
+    ShardingPlan,
+    ShardingType,
+)
+from torchrec.modules.embedding_modules import EmbeddingCollection
 
 import logging
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+def init_distributed(rank: int, world_size: int, backend: str = "nccl"):
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    return dist.group.WORLD
+
+def build_dense_dmp(
+    hstu_config,
+    table_config,
+    world_size,
+    rank,
+    pg,
+):
+    # 2. 构建模型（保持原本 HSTUTransducer 或 DlrmHSTU）
+    model = get_hstu_model(
+        table_config=table_config,
+        hstu_config=hstu_config,
+        table_device="meta",  # meta device 等待分片
+        is_dense=True,
+    ).to(torch.bfloat16)
+
+    # 3. 构建 topology
+    topology = Topology(world_size=world_size, compute_device="cuda")
+
+    # 4. 构建 planner
+    planner = EmbeddingShardingPlanner(topology=topology)
+
+    # 5. 选择 sharders
+    sharders = get_default_sharders()
+
+    # 6. 生成 plan
+    plan = planner.collective_plan(module=model, sharders=sharders, process_group=pg)
+
+    # 7. DistributedModelParallel 包装
+    dmp_model = DistributedModelParallel(
+        module=model,
+        env=ShardingEnv.from_process_group(pg),
+        plan=plan,
+        sharders=sharders,
+        device=torch.device(f"cuda:{rank}"),
+    )
+    return dmp_model
+
 class HSTUModelFamily:
     def __init__(
         self,
         hstu_config: DlrmHSTUConfig,
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
+        constraints: Dict[str, ParameterConstraints] = {},
+        backend: str = "nccl",
     ) -> None:
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.sparse: ModelFamilySparseDist = ModelFamilySparseDist(
             hstu_config=hstu_config,
             table_config=table_config,
+            constraints=constraints,
         )
 
         assert torch.cuda.is_available(), "CUDA is required for this benchmark."
         ngpus = torch.cuda.device_count()
         self.world_size = int(os.environ.get("WORLD_SIZE", str(ngpus)))
         print(f"Using {self.world_size} GPU(s)...")
-        dense_model_family_clazz = (
-            ModelFamilyDenseDist
-            if self.world_size > 1
-            else ModelFamilyDenseSingleWorker
-        )
+
+        # dense_model_family_clazz = (
+        #     ModelFamilyDenseDist
+        #     if self.world_size > 1
+        #     else ModelFamilyDenseSingleWorker
+        # )
+        dense_model_family_clazz = ModelFamilyDenseSingleWorker
+
         self.dense: Union[ModelFamilyDenseDist, ModelFamilyDenseSingleWorker] = (
             dense_model_family_clazz(
                 hstu_config=hstu_config,
@@ -121,53 +184,34 @@ class ModelFamilySparseDist:
         self,
         hstu_config: DlrmHSTUConfig,
         table_config: Dict[str, EmbeddingConfig],
+        constraints: Dict[str, ParameterConstraints],
     ) -> None:
         super(ModelFamilySparseDist, self).__init__()
         self.hstu_config = hstu_config
         self.table_config = table_config
-        self.module: Optional[torch.nn.Module] = None
-    """
-    def load(self, model_path: str) -> None:
-        print(f"Loading sparse module from {model_path}")
-
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        self.device = torch.device(f"cuda:{self.rank}")
+        torch.cuda.set_device(f"cuda:{self.rank}")
+        logger.info(f"[rank {self.rank}] local_size: {get_local_size()}")
+        self.constraints = constraints
+        self.module = None
+    
+    def _load_single_sparse(self,model_path):
         sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
             table_config=self.table_config,
             hstu_config=self.hstu_config,
         )
         load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
         sparse_arch.eval()
-        self.module = quant.quantize_dynamic(
-            sparse_arch,
-            qconfig_spec={
-                torchrec.EmbeddingCollection: QuantConfig(
-                    activation=quant.PlaceholderObserver.with_args(dtype=torch.float),
-                    weight=quant.PlaceholderObserver.with_args(dtype=torch.int8),
-                ),
-            },
-            mapping={
-                torchrec.EmbeddingCollection: QuantEmbeddingCollection,
-            },
-            inplace=False,
-        )
-        print(f"sparse module is {self.module}")
-    """
-
-    def load(self, model_path: str) -> None:
-        logger.info(f"Loading sparse module from {model_path}")
-        # 如果只用单进程单卡，保持原逻辑
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if world_size == 1:
-            sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
-                table_config=self.table_config,
-                hstu_config=self.hstu_config,
-            )
-            load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
-            sparse_arch.eval()
+        if self.quant:
             self.module = quant.quantize_dynamic(
                 sparse_arch,
                 qconfig_spec={
                     torchrec.EmbeddingCollection: QuantConfig(
-                        activation=quant.PlaceholderObserver.with_args(dtype=torch.float),
+                        activation=quant.PlaceholderObserver.with_args(
+                            dtype=torch.float
+                        ),
                         weight=quant.PlaceholderObserver.with_args(dtype=torch.int8),
                     ),
                 },
@@ -176,51 +220,57 @@ class ModelFamilySparseDist:
                 },
                 inplace=False,
             )
-            print(f"sparse module is {self.module}")
-            return
+        else:
+            self.module = sparse_arch
+        print(f"sparse module is {self.module}")
 
-        # 多卡：用 DMP 对 _hstu_model 做分片（EmbeddingCollection -> ShardedEmbeddingCollection）
-        # 需要每卡一个进程初始化 PG，这里只展示单进程骨架，实战请仿照 DenseDist 的多进程结构
-        rank = int(os.environ.get("RANK", "0"))
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+    def _load_distributed_sparse(self, 
+        constraints: Dict[str, ParameterConstraints],
+    ) -> None:
+        ebc = EmbeddingCollection(
+            tables=list(self.table_config.values()),
+            need_indices=False,
+            device=torch.device("meta"),
+        )
 
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        # planner + sharders
+        topology = Topology(world_size=self.world_size, compute_device="cuda")
+        planner = EmbeddingShardingPlanner(
+            topology=topology,
+            constraints=constraints,
+        )
+        sharders = get_default_sharders()
+        logger.info(f"dist.get_rank():{dist.get_rank()}")
+        torch.cuda.set_device(dist.get_rank())
+        plan: ShardingPlan = planner.collective_plan(module=ebc, sharders=sharders, pg=dist.group.WORLD)
+        logger.info(f"[rank {self.rank}] sharding plan _serialize:{plan._serialize()}.")
+        # DMP 封装
+        sharded_model= DistributedModelParallel(
+            module=ebc,
+            env=ShardingEnv.from_process_group(dist.group.WORLD),
+            plan=plan,
+            sharders=sharders,
+            device=self.device,
+        )
 
-        sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
+        self.module = HSTUSparseInferenceModule(
             table_config=self.table_config,
             hstu_config=self.hstu_config,
-        )
-        # 先加载稀疏权重到原模型
-        load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
-        sparse_arch._hstu_model.eval()
+            embedding_collection=sharded_model,
+        ).to(self.device)
+        
 
-        # 生成分片 plan 并包 DMP（关键：传入整个模型，sharder 会找到 EmbeddingCollection 并替换为 ShardedEmbeddingCollection）
-        planner = EmbeddingShardingPlanner(
-            topology=Topology(
-                local_world_size=get_local_size(),
-                world_size=world_size,
-                compute_device="cuda",
-            )
-        )
-        plan = planner.collective_plan(
-            module=sparse_arch._hstu_model,  # DlrmHSTU
-            sharders=get_default_sharders(),
-            group=dist.group.WORLD,
-        )
-        sharded_hstu = DistributedModelParallel(
-            module=sparse_arch._hstu_model,
-            device=device,
-            plan=plan,
-        )
-        # 用分片后的 hstu 替换回稀疏模块
-        sparse_arch._hstu_model = sharded_hstu
-        sparse_arch = sparse_arch.to(device)
-        sparse_arch.eval()
-
-        # 如果需要量化，注意不要再把 EmbeddingCollection 映射成 QuantEmbeddingCollection（此时已是 ShardedEmbeddingCollection）
-        self.module = sparse_arch
-        print(f"sparse module is {self.module}")
+    def load(self, model_path: str) -> None:
+        logger.info(f"Loading sparse module from {model_path}")
+        if self.world_size > 1:
+            # 多卡 DMP 逻辑
+            logger.info(f"[rank {self.rank}] Loading sparse module (DMP) from {model_path}")
+            self._load_distributed_sparse(constraints=self.constraints)
+            self.module.eval()
+        else:
+            # 单卡逻辑
+            logger.info(f"rank:{self.rank} Loading sparse module (single GPU) from {model_path}")
+            self._load_single_sparse(model_path)
 
     def predict(
         self, samples: Samples
@@ -234,9 +284,11 @@ class ModelFamilySparseDist:
     ]:
         with torch.profiler.record_function("sparse forward"):
             assert self.module is not None
-            uih_features = samples.uih_features_kjt
-            candidates_features = samples.candidates_features_kjt
-            t0 = time.perf_counter()
+            # 自动获取模型所在 device
+            logger.info(f"device:{self.device}")
+            # 把 KeyedJaggedTensor 移到 GPU
+            uih_features = samples.uih_features_kjt.to(self.device)
+            candidates_features = samples.candidates_features_kjt.to(self.device)
             (
                 seq_embeddings,
                 payload_features,
@@ -248,8 +300,6 @@ class ModelFamilySparseDist:
                 uih_features=uih_features,
                 candidates_features=candidates_features,
             )
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            logger.info(f"[sparse] forward took {dt_ms:.3f} ms")
             return (
                 seq_embeddings,
                 payload_features,
@@ -312,72 +362,70 @@ class ModelFamilyDenseDist:
             max_hash_size=100,
             is_dense=True,
         ).to(torch.bfloat16)
-        load_nonsparse_checkpoint(model=model, optimizer=None, path=model_path)
-
         device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(f"cuda:{rank}")
+        load_nonsparse_checkpoint(
+            model=model, device=device, optimizer=None, path=model_path
+        )
         self.main_lock.set()
         model = model.to(device)
         model.eval()
         profiler = Profiler(rank) if self.output_trace else None
 
-        while True:
-            if self.samples_q[rank].empty():
-                time.sleep(0.001)
-                continue
-            item = self.samples_q[rank].get()
-            # If -1 is received terminate all subprocesses
-            if item == -1:
-                break
-            (
-                id,
-                seq_embeddings,
-                payload_features,
-                max_uih_len,
-                uih_seq_lengths,
-                max_num_candidates,
-                num_candidates,
-            ) = item
-            assert seq_embeddings is not None
-            if self.output_trace:
-                assert profiler is not None
-                profiler.step()
-            with torch.profiler.record_function("dense forward"):
-                t0 = time.perf_counter()
+        with torch.no_grad():
+            while True:
+                if self.samples_q[rank].empty():
+                    time.sleep(0.001)
+                    continue
+                item = self.samples_q[rank].get()
+                # If -1 is received terminate all subprocesses
+                if item == -1:
+                    break
                 (
-                    _,
-                    _,
-                    _,
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                ) = model.main_forward(
-                    seq_embeddings=seq_embeddings,
-                    payload_features=payload_features,
-                    max_uih_len=max_uih_len,
-                    uih_seq_lengths=uih_seq_lengths,
-                    max_num_candidates=max_num_candidates,
-                    num_candidates=num_candidates,
-                )
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                logger.info(f"[dense][rank {rank}] forward took {dt_ms:.3f} ms")
-                assert mt_target_preds is not None
-                mt_target_preds = mt_target_preds.detach().to(
-                    device="cpu", non_blocking=True
-                )
-                if mt_target_labels is not None:
-                    mt_target_labels = mt_target_labels.detach().to(
+                    id,
+                    seq_embeddings,
+                    payload_features,
+                    max_uih_len,
+                    uih_seq_lengths,
+                    max_num_candidates,
+                    num_candidates,
+                ) = item
+                assert seq_embeddings is not None
+                if self.output_trace:
+                    assert profiler is not None
+                    profiler.step()
+                with torch.profiler.record_function("dense forward"):
+                    (
+                        _,
+                        _,
+                        _,
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
+                    ) = model.main_forward(
+                        seq_embeddings=seq_embeddings,
+                        payload_features=payload_features,
+                        max_uih_len=max_uih_len,
+                        uih_seq_lengths=uih_seq_lengths,
+                        max_num_candidates=max_num_candidates,
+                        num_candidates=num_candidates,
+                    )
+                    assert mt_target_preds is not None
+                    mt_target_preds = mt_target_preds.detach().to(
                         device="cpu", non_blocking=True
                     )
-                if mt_target_weights is not None:
-                    mt_target_weights = mt_target_weights.detach().to(
-                        device="cpu", non_blocking=True
+                    if mt_target_labels is not None:
+                        mt_target_labels = mt_target_labels.detach().to(
+                            device="cpu", non_blocking=True
+                        )
+                    if mt_target_weights is not None:
+                        mt_target_weights = mt_target_weights.detach().to(
+                            device="cpu", non_blocking=True
+                        )
+                    self.predictions_cache[rank][id] = (
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
                     )
-                self.predictions_cache[rank][id] = (
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                )
 
     def capture_output(
         self, id: uuid.UUID, rank: int
@@ -454,7 +502,11 @@ class ModelFamilyDenseSingleWorker:
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.output_trace = output_trace
-        self.device: torch.device = torch.device("cuda:0")
+        self.rank = dist.get_rank()       # 当前进程的 rank
+        self.world_size = dist.get_world_size()  # 总进程数
+        gpu_count = torch.cuda.device_count()  # 当前节点 GPU 数量
+        # 将 rank 映射到 GPU
+        self.device = torch.device(f"cuda:{self.rank % gpu_count}")
         torch.cuda.set_device(self.device)
         self.profiler: Optional[Profiler] = (
             Profiler(rank=0) if self.output_trace else None
@@ -466,7 +518,7 @@ class ModelFamilyDenseSingleWorker:
             get_hstu_model(
                 table_config=self.table_config,
                 hstu_config=self.hstu_config,
-                table_device="cpu",
+                table_device=self.device,
                 is_dense=True,
             )
             .to(self.device)
@@ -496,6 +548,7 @@ class ModelFamilyDenseSingleWorker:
         )
         with torch.profiler.record_function("dense forward"):
             t0 = time.perf_counter()
+            logger.info(f"rank:{self.rank} before move_sparse_output_to_device")
             seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
                 move_sparse_output_to_device(
                     seq_embeddings=seq_embeddings,
@@ -505,6 +558,7 @@ class ModelFamilyDenseSingleWorker:
                     device=self.device,
                 )
             )
+            logger.info(f"rank:{self.rank} main_forward start")
             assert self.model is not None
             (
                 _,
@@ -522,7 +576,7 @@ class ModelFamilyDenseSingleWorker:
                 num_candidates=num_candidates,
             )
             dt_ms = (time.perf_counter() - t0) * 1000.0
-            logger.info(f"[dense][single] forward took {dt_ms:.3f} ms")
+            logger.info(f"[dense]rank:{self.rank} forward took {dt_ms:.3f} ms")
             assert mt_target_preds is not None
             mt_target_preds = mt_target_preds.detach().to(
                 device="cpu", non_blocking=True

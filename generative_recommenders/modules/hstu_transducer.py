@@ -137,6 +137,14 @@ class HSTUTransducer(HammerModule):
                 num_targets=num_targets,
                 seq_payloads=seq_payloads,
             )
+        print("output_max_seq_len:", output_max_seq_len)
+        print("output_total_uih_len:", output_total_uih_len)
+        print("output_total_targets:", output_total_targets)
+        print("output_seq_lengths:", output_seq_lengths.shape, output_seq_lengths)
+        print("output_seq_offsets:", output_seq_offsets.shape, output_seq_offsets)
+        print("output_seq_timestamps:", output_seq_timestamps.shape, output_seq_timestamps)
+        print("output_seq_embeddings:", output_seq_embeddings.shape)
+        print("output_num_targets:", output_num_targets.shape, output_num_targets)
 
         with record_function("hstu_positional_encoder"):
             if self._positional_encoder is not None:
