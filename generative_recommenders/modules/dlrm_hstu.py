@@ -382,13 +382,24 @@ class DlrmHSTU(HammerModule):
                 dim=0,
             ),
         )
-        logger.debug(f"process id:{os.getpid()} Keys: {merged_sparse_features.keys()}")
-        logger.debug(f"process id:{os.getpid()} Values device: {merged_sparse_features.values().device}, shape: {merged_sparse_features.values().shape}")
-        logger.debug(f"process id:{os.getpid()} Values sample: {merged_sparse_features.values()[:10]}")  # 打印前10个值
-        logger.debug(f"process id:{os.getpid()} Lengths device: {merged_sparse_features.lengths().device}, shape: {merged_sparse_features.lengths().shape}")
-        logger.debug(f"process id:{os.getpid()} Lengths sample: {merged_sparse_features.lengths()[:10]}")  # 打印前10个长度
-        logger.debug(f"process id:{os.getpid()} [sparse] rank:{self.rank} embedding lookup start")
-
+        # 新增形状与统计信息日志
+        num_keys = len(merged_sparse_features.keys())
+        total_values = merged_sparse_features.values().numel()
+        total_lengths = merged_sparse_features.lengths().numel()
+        batch_size = total_lengths // num_keys if num_keys > 0 else 0
+        logger.debug(
+            f"[merged_sparse_features] num_keys={num_keys}, batch_size={batch_size}, "
+            f"total_values={total_values}, lengths_tensor_shape={merged_sparse_features.lengths().shape}, "
+            f"values_tensor_shape={merged_sparse_features.values().shape}"
+        )
+        for k in merged_sparse_features.keys():
+            jt = merged_sparse_features[k]
+            logger.debug(
+                f"[merged_sparse_features::{k}] lengths_shape={jt.lengths().shape}, "
+                f"values_shape={jt.values().shape}, lengths_sample={jt.lengths()[:5]}, "
+                f"values_sample={jt.values()[:5]}"
+            )
+        
         t0 = time.perf_counter()
         seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
         t1 = time.perf_counter()

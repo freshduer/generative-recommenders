@@ -311,8 +311,7 @@ def run(
     constraints=gen_constraints_from_table_config(
         table_config,
         # sharding_type=ShardingType.DATA_PARALLEL,
-        sharding_type=ShardingType.ROW_WISE,
-        # sharding_type=ShardingType.TABLE_WISE,
+        sharding_type=ShardingType.TABLE_WISE,
     )
     # 打印 constraints 概览与详细内容
     try:

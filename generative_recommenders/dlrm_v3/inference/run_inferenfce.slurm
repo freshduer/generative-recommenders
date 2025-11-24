@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:2
 
 # 指定节点列表（node25, 26、node27 或 node28）
-# SBATCH --nodelist=gpu25
+# SBATCH --nodelist=gpu24
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=32
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-shard/%x_%j.out
-#SBATCH --error=logs-shard/%x_%j.err
+#SBATCH --output=logs-benchmark/%x_%j.out
+#SBATCH --error=logs-benchmark/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -73,7 +73,11 @@ echo "开始执行脚本"
 # WORLD_SIZE=1 python main.py --dataset kuairand-1k
 # WORLD_SIZE=1 python main.py --dataset movielens-20m
 # WORLD_SIZE=1 python main.py --dataset debug
-torchrun --nproc_per_node=2 main.py
+# torchrun --nproc_per_node=2 main.py
+
+##test
+# torchrun --nproc_per_node=2 test_custom_sharding.py
+torchrun --nproc_per_node=2 benchmark/b_emb1.py
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活

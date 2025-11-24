@@ -72,43 +72,6 @@ def init_distributed(rank: int, world_size: int, backend: str = "nccl"):
     torch.cuda.set_device(rank)
     return dist.group.WORLD
 
-def build_dense_dmp(
-    hstu_config,
-    table_config,
-    world_size,
-    rank,
-    pg,
-):
-    # 2. 构建模型（保持原本 HSTUTransducer 或 DlrmHSTU）
-    model = get_hstu_model(
-        table_config=table_config,
-        hstu_config=hstu_config,
-        table_device="meta",  # meta device 等待分片
-        is_dense=True,
-    ).to(torch.bfloat16)
-
-    # 3. 构建 topology
-    topology = Topology(world_size=world_size, compute_device="cuda")
-
-    # 4. 构建 planner
-    planner = EmbeddingShardingPlanner(topology=topology)
-
-    # 5. 选择 sharders
-    sharders = get_default_sharders()
-
-    # 6. 生成 plan
-    plan = planner.collective_plan(module=model, sharders=sharders, process_group=pg)
-
-    # 7. DistributedModelParallel 包装
-    dmp_model = DistributedModelParallel(
-        module=model,
-        env=ShardingEnv.from_process_group(pg),
-        plan=plan,
-        sharders=sharders,
-        device=torch.device(f"cuda:{rank}"),
-    )
-    return dmp_model
-
 class HSTUModelFamily:
     def __init__(
         self,
@@ -227,6 +190,23 @@ class ModelFamilySparseDist:
     def _load_distributed_sparse(self, 
         constraints: Dict[str, ParameterConstraints],
     ) -> None:
+        # 环境变量控制是否启用自定义分片
+        # if os.environ.get("CUSTOM_SHARDING", "0") == "1":
+        from generative_recommenders.dlrm_v3.inference.custom_sharding import CustomEmbeddingCollection
+        logger.info(f"[rank {self.rank}] Using CustomEmbeddingCollection manual sharding")
+        custom_ec = CustomEmbeddingCollection(
+            table_config={cfg.name: cfg for cfg in self.table_config.values()},
+            constraints=constraints,
+            device=torch.device("cuda")
+        )
+        # 注意: 如果需要从原始 checkpoint 中加载嵌入，请在外部调用 custom_ec.set_weights_for_key(key, full_weight)
+        self.module = HSTUSparseInferenceModule(
+            table_config=self.table_config,
+            hstu_config=self.hstu_config,
+            embedding_collection=custom_ec,
+        ).to(self.device)
+        return
+    
         ebc = EmbeddingCollection(
             tables=list(self.table_config.values()),
             need_indices=False,
