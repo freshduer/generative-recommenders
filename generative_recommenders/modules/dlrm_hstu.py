@@ -52,6 +52,7 @@ from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 import torch.distributed as dist
 import os
+import numpy as np
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -136,6 +137,7 @@ class DlrmHSTU(HammerModule):
         self._hstu_configs = hstu_configs
         self._bf16_training: bool = bf16_training
         set_static_max_seq_lens([self._hstu_configs.max_seq_len])
+        self.sparse_times = []
 
         if not is_dense:
             # self._embedding_collection: EmbeddingCollection = EmbeddingCollection(
@@ -256,6 +258,19 @@ class DlrmHSTU(HammerModule):
             ),
             LayerNorm(hstu_configs.hstu_transducer_embedding_dim),
         ).apply(init_mlp_weights_optional_bias)
+    
+    def report_sparse_latency_stats(self):
+        if not self.sparse_times:
+            logger.info("No sparse timing data collected yet.")
+            return
+
+        arr = np.array(self.sparse_times)
+        median = np.percentile(arr, 50)
+        p99 = np.percentile(arr, 99)
+
+        logger.info(
+            f"[sparse][rank:{self.rank}] stats: median={median:.3f} ms, p99={p99:.3f} ms (n={len(arr)})"
+        )
 
     def _construct_payload(
         self,
@@ -403,7 +418,10 @@ class DlrmHSTU(HammerModule):
         t0 = time.perf_counter()
         seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
         t1 = time.perf_counter()
-        logger.info(f"[sparse] rank:{self.rank} embedding lookup done, time: {(t1 - t0) * 1000:.3f} ms")
+        dt_ms = (t1 - t0) * 1000.0
+        self.sparse_times.append(dt_ms)
+        logger.info(f"[sparse] rank:{self.rank} embedding lookup done, time: {dt_ms:.3f} ms")
+        self.report_sparse_latency_stats()
         num_candidates = fx_mark_length_features(
             candidates_features.lengths().view(len(candidates_features.keys()), -1)
         )[0]

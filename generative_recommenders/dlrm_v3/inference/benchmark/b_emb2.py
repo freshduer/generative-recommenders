@@ -25,7 +25,7 @@ except ImportError as e:
 # ============================================================================
 # 2. 全局常量配置
 # ============================================================================
-NUM_EMBEDDINGS = 5_000_000  # 模拟 500万 items
+NUM_EMBEDDINGS = 10_000_000  # 模拟 1000万 items
 EMBEDDING_DIM = 256
 HOT_RATIO = 0.10            # 10% 的热点 ID
 ACCESS_RATIO = 0.90         # 90% 的访问集中在热点 ID
@@ -158,8 +158,12 @@ def run_benchmark(rank: int, model: torch.nn.Module, batch_size: int, device: to
     
     with torch.no_grad():
         for i in range(BENCH_STEPS):
+            t0 = time.perf_counter()
             # print(f"Rank {rank} - Step {i+1}/{BENCH_STEPS} for batch_size:{batch_size}")
             _ = model(input_kjt)
+            t1 = time.perf_counter()
+            dt_ms = (t1 - t0) * 1000.0
+            print(f"[sparse] rank:{rank} embedding lookup done, time: {dt_ms:.3f} ms")
         
     end_event.record()
     torch.cuda.synchronize()

@@ -89,9 +89,9 @@ from torchrec.distributed.types import (
     ModuleSharder,
     ShardingEnv,
     ShardingPlan,
-    ShardingType,
 )
 import torch.distributed as dist
+from custom_sharding import ShardingType
 _mem("F_after_torch_distributed")
 
 logger: logging.Logger = logging.getLogger("main")
@@ -350,7 +350,9 @@ def run(
     constraints=gen_constraints_from_table_config(
         table_config,
         # sharding_type=ShardingType.DATA_PARALLEL,
-        sharding_type=ShardingType.TABLE_WISE,
+        # sharding_type=ShardingType.TABLE_WISE,
+        sharding_type=ShardingType.REPLICATED,
+        # sharding_type=ShardingType.CPU_OFFLOAD,
     )
     # 打印 constraints 概览与详细内容
     try:

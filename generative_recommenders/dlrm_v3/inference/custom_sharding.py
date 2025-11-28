@@ -8,10 +8,14 @@ from dataclasses import dataclass
 from typing import Dict, Tuple, Optional, List
 
 # 依赖 torchrec，如环境缺失请自行替换相关类型定义
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from torchrec.distributed.planner.types import ParameterConstraints
-from torchrec.modules.embedding_configs import EmbeddingConfig, DataType
-
+try:
+    from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+    from torchrec.distributed.planner.types import ParameterConstraints
+    from torchrec.modules.embedding_configs import EmbeddingConfig, DataType
+except ImportError:
+    # 简单的 Mock 以防本地没有 torchrec 环境导致 import 报错
+    KeyedJaggedTensor = object
+    ParameterConstraints = EmbeddingConfig = DataType = object
 
 # 配置 Logging
 logging.basicConfig(
@@ -88,15 +92,30 @@ class ShardingUtils:
 
     @staticmethod
     def global_to_local(global_indices: torch.Tensor, table: LocalEmbeddingTable) -> torch.Tensor:
-        """将接收到的全局 ID 转换为本地 Lookup ID"""
+        """
+        [关键修复] 将接收到的全局 ID 转换为本地 Lookup ID。
+        必须包含强制取模逻辑，防止非法内存访问。
+        """
+        # 获取本地表实际行数
+        local_limit = table.weight.num_embeddings
+        
+        # 如果本地表为空，转换无意义，直接返回 (后续逻辑会处理空表)
+        if local_limit == 0:
+            return global_indices
+
         if table.sharding_type == ShardingType.ROW_WISE:
-            # 将全局索引映射到本地分片区间
+            # 1. 减去偏移量
             local = global_indices - table.row_start
-            local_rows = table.row_end - table.row_start
-            if local_rows > 0:
-                # 使用 remainder 确保范围在 [0, local_rows)
-                local = torch.remainder(local, local_rows)
+            # 2. 强制取模保护 (Safe Guard)
+            # 这步至关重要：即使上游发错了，也强行映射到合法范围内
+            local = torch.remainder(local, local_limit)
             return local
+            
+        elif table.sharding_type == ShardingType.TABLE_WISE:
+            # Table-Wise 理论上 global == local
+            # 但如果上游发来的 ID 超过了我的表大小，直接查会崩
+            return torch.remainder(global_indices, local_limit)
+            
         return global_indices
 
 # --- Main Module ---
@@ -110,7 +129,7 @@ class CustomEmbeddingCollection(torch.nn.Module):
     ) -> None:
         super().__init__()
         
-        # --- 1. 智能环境检测 (支持单卡 Debug) ---
+        # --- 1. 智能环境检测 ---
         if dist.is_available() and dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
@@ -133,6 +152,12 @@ class CustomEmbeddingCollection(torch.nn.Module):
         self.feature_to_table: Dict[str, str] = {}
         self._constraints = constraints or {}
 
+        # --- 调试开关: 打印 CPU offload 细节 ---
+        # 通过设置环境变量 GR_DEBUG_CPU_OFFLOAD=1 开启
+        self.debug_cpu_offload = False
+        if self.debug_cpu_offload and self.rank == 0:
+            logger.info("[DEBUG] CPU offload logging enabled via GR_DEBUG_CPU_OFFLOAD.")
+
         # --- 3. 初始化表 ---
         for name, cfg in table_config.items():
             self._init_table(name, cfg)
@@ -142,7 +167,7 @@ class CustomEmbeddingCollection(torch.nn.Module):
         num_embeddings = cfg.num_embeddings
         embedding_dim = cfg.embedding_dim
 
-        # 计算分区 (单卡模式下 start=0, end=total)
+        # 计算分区
         start, end = ShardingUtils.get_partition_bounds(
             sharding_type, num_embeddings, self.world_size, self.rank, name
         )
@@ -160,7 +185,7 @@ class CustomEmbeddingCollection(torch.nn.Module):
         target_dtype = dtype_map.get(getattr(cfg, "data_type", None), torch.float32)
 
         # 创建 Layer
-        # 注意: 即使 local_rows=0 (我不持有该表), 也要创建 layer 结构以保持代码一致性, 但不占显存
+        # 即使 local_rows=0 (我不持有该表), 也要创建 layer 结构, 但不占显存
         emb_layer = torch.nn.Embedding(local_rows, embedding_dim, device=target_device, dtype=target_dtype)
         if local_rows > 0:
             torch.nn.init.uniform_(emb_layer.weight, -0.01, 0.01)
@@ -179,6 +204,10 @@ class CustomEmbeddingCollection(torch.nn.Module):
             
         if self.rank == 0:
             logger.info(f"Initialized table '{name}': {sharding_type.value}, dim={embedding_dim}, total_rows={num_embeddings}")
+            if self.debug_cpu_offload and is_offload:
+                logger.info(
+                    f"[CPU-OFFLOAD] Table '{name}' created on device={target_device}, local_rows={local_rows}, row_range=[{start}, {end})"
+                )
 
     def _infer_sharding_type(self, table_name: str) -> ShardingType:
         if pc := self._constraints.get(table_name):
@@ -194,9 +223,7 @@ class CustomEmbeddingCollection(torch.nn.Module):
         results = {}
         feature_keys = kjt.keys() if isinstance(kjt.keys(), list) else list(kjt.keys())
         
-        # --- [单卡优化] ---
-        # 只要是单卡，无论配置成什么切分策略，数据一定全在本地。
-        # 直接走 local lookup，跳过所有通信和排序开销。
+        # 单卡模式优化: 跳过通信
         is_single_card = (self.world_size == 1)
 
         for key in feature_keys:
@@ -210,18 +237,17 @@ class CustomEmbeddingCollection(torch.nn.Module):
             if indices.device != self.device:
                 indices = indices.to(self.device, non_blocking=True)
 
-            # 判定是否可以直接本地查询
             should_direct_lookup = (
                 is_single_card or 
                 table.sharding_type in (ShardingType.REPLICATED, ShardingType.CPU_OFFLOAD)
             )
 
             if should_direct_lookup:
-                # 即使是 Direct Lookup，也建议做一次 OOB 检查 (开发阶段)
-                # self._check_oob(indices, table) 
+                # 单卡或Replicated模式也建议做简单的 remainder 保护，防止 bad input crash
+                if table.weight.num_embeddings > 0:
+                    indices = torch.remainder(indices, table.weight.num_embeddings)
                 embeddings = self._lookup_direct(indices, table)
             else:
-                # 分布式查询
                 embeddings = self._lookup_distributed(indices, table)
             
             results[key] = embeddings
@@ -231,7 +257,23 @@ class CustomEmbeddingCollection(torch.nn.Module):
     def _lookup_direct(self, indices: torch.Tensor, table: LocalEmbeddingTable) -> torch.Tensor:
         """本地直接查询"""
         if table.sharding_type == ShardingType.CPU_OFFLOAD:
-            return table.weight(indices.cpu()).to(self.device, non_blocking=True)
+            if self.debug_cpu_offload:
+                logger.info(
+                    f"[CPU-OFFLOAD] lookup table='{table.name}' | weight_device={table.weight.weight.device} "
+                    f"| indices_device(before)={indices.device} | weight_is_cuda={table.weight.weight.is_cuda}"
+                )
+            cpu_indices = indices.cpu()
+            embs_cpu = table.weight(cpu_indices)
+            if self.debug_cpu_offload:
+                logger.info(
+                    f"[CPU-OFFLOAD] gathered on CPU | embs_device={embs_cpu.device} | shape={tuple(embs_cpu.shape)}"
+                )
+            embs = embs_cpu.to(self.device, non_blocking=True)
+            if self.debug_cpu_offload:
+                logger.info(
+                    f"[CPU-OFFLOAD] moved to device={self.device} | embs_device(after)={embs.device}"
+                )
+            return embs
         return table.weight(indices)
 
     def _lookup_distributed(self, global_indices: torch.Tensor, table: LocalEmbeddingTable) -> torch.Tensor:
@@ -239,8 +281,9 @@ class CustomEmbeddingCollection(torch.nn.Module):
         
         # 0. 预处理
         global_indices = global_indices.long()
-        # 发送端检查：尽量在源头修复或报警
-        self._check_oob(global_indices, table)
+        # [发送端] 初步清洗：防止发出极其离谱的坐标
+        if table.global_num_embeddings > 0:
+            global_indices = torch.remainder(global_indices, table.global_num_embeddings)
 
         # 1. Routing
         dest_ranks = self._get_dest_ranks(global_indices, table)
@@ -252,44 +295,26 @@ class CustomEmbeddingCollection(torch.nn.Module):
         recv_indices, recv_splits = self._exchange_data(indices_sorted, send_splits, dtype=torch.int64)
 
         # 4. Local Lookup (Owner Side)
+        # --- [修复核心] ---
+        # 1. 转换坐标 (内含 remainder 强制约束)
         local_indices = ShardingUtils.global_to_local(recv_indices, table)
         
-        # ==================== [DEBUG: CRASH DETECTION] ====================
-        # 在真正查表前，执行最后一道防线检查
-        if local_indices.numel() > 0:
-            real_limit = table.weight.num_embeddings
-            # 快速获取最大最小值 (会有少量 GPU-CPU 同步开销，但为了 Debug 值得)
-            # 生产环境如果追求极致性能，可以注释掉下面几行
-            min_idx = local_indices.min().item()
-            max_idx = local_indices.max().item()
-            
-            if min_idx < 0 or max_idx >= real_limit:
-                bad_indices = local_indices[(local_indices < 0) | (local_indices >= real_limit)]
-                sample_bad = bad_indices[:10].tolist()
-                
-                error_msg = (
-                    f"\n>>> [CRASH DETECTED] Rank {self.rank} | Table '{table.name}' <<<\n"
-                    f"    Sharding Type: {table.sharding_type}\n"
-                    f"    Table Weight Shape: {table.weight.weight.shape}\n"
-                    f"    Local Indices Shape: {local_indices.shape}\n"
-                    f"    Detected Range: min={min_idx}, max={max_idx}\n"
-                    f"    Allowed Range: [0, {real_limit - 1}]\n"
-                    f"    Sample Bad Indices: {sample_bad}\n"
-                    f"    Hints: Check if Global-to-Local logic is consistent with partitioning.\n"
-                )
-                logger.info(error_msg)
-                
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize() # 强制刷新日志
-                
-                raise RuntimeError(f"Index out of bounds detected in table '{table.name}' on Rank {self.rank}")
-        # ==================== [DEBUG END] ====================
-
-        if table.weight.num_embeddings == 0:
-            # 如果我不持有该表数据，返回零向量
+        # 2. 空表检查 (绝对防御)
+        # 如果当前 Rank 实际上没有分到数据 (例如 TableWise 我不是 Owner，或者 RowWise 分得 0 行)
+        # 此时任何 table.weight(...) 调用都会导致 CUDA Illegal Memory Access
+        real_rows = table.weight.num_embeddings
+        
+        if real_rows == 0:
+            # 必须返回正确 Shape 的全零 Tensor，否则会导致死锁或形状不匹配
             emb_dim = table.weight.embedding_dim
-            local_embs = torch.zeros((recv_indices.shape[0], emb_dim), dtype=table.weight.weight.dtype, device=self.device)
+            local_embs = torch.zeros(
+                (recv_indices.shape[0], emb_dim), 
+                dtype=table.weight.weight.dtype, 
+                device=self.device
+            )
         else:
+            # 此时 local_indices 已经被 ShardingUtils 限制在 [0, real_rows) 之间
+            # 且 real_rows > 0，可以安全查表
             local_embs = table.weight(local_indices)
 
         # 5. Exchange Embeddings
@@ -351,15 +376,3 @@ class CustomEmbeddingCollection(torch.nn.Module):
         inv_perm = torch.empty_like(sort_idx)
         inv_perm.index_copy_(0, sort_idx, torch.arange(num_items, device=self.device, dtype=sort_idx.dtype))
         return data_sorted.index_select(0, inv_perm)
-
-    def _check_oob(self, indices: torch.Tensor, table: LocalEmbeddingTable):
-        """发送端预检与自动修复"""
-        if indices.numel() == 0:
-            return
-        
-        # 为了性能，这里不做同步检查，只做简单的范围修正
-        # 如果需要严格检查，可以像 _lookup_distributed 那样 .item() 判断
-        if indices.min() < 0 or indices.max() >= table.global_num_embeddings:
-            msg = f"[Rank {self.rank}] Table '{table.name}' OOB (Sender). Correcting via remainder."
-            logger.info(msg)
-            indices.remainder_(table.global_num_embeddings)

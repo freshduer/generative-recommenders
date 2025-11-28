@@ -56,6 +56,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from generative_recommenders.dlrm_v3.inference.custom_sharding import CustomEmbeddingCollection
+import numpy as np
 
 import logging
 logging.basicConfig()
@@ -126,7 +127,9 @@ class HSTUModelFamily:
     def load(self, model_path: str) -> None:
         log_gpu_memory(prefix=f"Before init sparse:")
         self.sparse.load(model_path=model_path)
+        log_gpu_memory(prefix=f"After init sparse:")
         self.dense.load(model_path=model_path)
+        log_gpu_memory(prefix=f"After init dense:")
 
     def predict(
         self, samples: Optional[Samples]
@@ -164,10 +167,31 @@ class ModelFamilySparseDist:
         self.table_config = table_config
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.device = torch.device(f"cuda:{self.rank}")
-        torch.cuda.set_device(f"cuda:{self.rank}")
-        logger.info(f"[rank {self.rank}] local_size: {get_local_size()}")
+        # 先解析是否存在 CPU_OFFLOAD 约束
         self.constraints = constraints
+        try:
+            has_cpu_offload = all(
+                any((s or '').lower() == 'cpu_offload' for s in (pc.sharding_types or []))
+                for pc in self.constraints.values()
+            ) and len(self.constraints) > 0
+        except Exception:
+            has_cpu_offload = False
+        # 如果全部表都是 cpu_offload，则将 sparse 部分的主执行设备设为 CPU，避免不必要的 H2D 迁移
+        if has_cpu_offload:
+            self.device = torch.device("cpu")
+            logger.info(f"[rank {self.rank}] All constraints cpu_offload -> sparse device=CPU")
+        else:
+            self.device = torch.device(f"cuda:{self.rank}")
+            torch.cuda.set_device(self.device)
+            logger.info(f"[rank {self.rank}] sparse device set to {self.device}; local_size: {get_local_size()}")
+        # 若并非全部 offload，但存在部分 cpu_offload，仍保持 GPU 设备以便统一输出
+        if not has_cpu_offload:
+            cpu_offload_partial = any(
+                any((s or '').lower() == 'cpu_offload' for s in (pc.sharding_types or []))
+                for pc in self.constraints.values()
+            )
+            if cpu_offload_partial:
+                logger.info(f"[rank {self.rank}] Partial cpu_offload detected -> embeddings将逐表决定设备")
         self.module = None
         self.quant: bool = quant
     
@@ -176,7 +200,7 @@ class ModelFamilySparseDist:
         custom_ec = CustomEmbeddingCollection(
             table_config={cfg.name: cfg for cfg in self.table_config.values()},
             constraints=self.constraints,
-            device=torch.device("cuda")
+            device=self.device  # 根据是否 offload 传入 CPU 或 GPU
         )
         if self.quant:
             self.sparse_arch = HSTUSparseInferenceModule(
@@ -269,8 +293,13 @@ class ModelFamilySparseDist:
             self._load_distributed_sparse(constraints=self.constraints)
             self.module.eval()
         else:
-            # 单卡逻辑
-            logger.info(f"rank:{self.rank} Loading sparse module (single GPU) from {model_path}")
+            if self.device.type == "cuda":
+                mode = "single GPU"
+            else:
+                mode = "CPU"
+            logger.info(
+                f"rank:{self.rank} Loading sparse module ({mode}) from {model_path}"
+            )
             self._load_single_sparse(model_path)
 
     def predict(
@@ -287,9 +316,13 @@ class ModelFamilySparseDist:
             assert self.module is not None
             # 自动获取模型所在 device
             logger.info(f"device:{self.device}")
-            # 把 KeyedJaggedTensor 移到 GPU
-            uih_features = samples.uih_features_kjt.to(self.device)
-            candidates_features = samples.candidates_features_kjt.to(self.device)
+            # 如果设备是 CPU (全部 offload)，保持特征在 CPU；否则迁移到 GPU
+            if self.device.type == 'cpu':
+                uih_features = samples.uih_features_kjt
+                candidates_features = samples.candidates_features_kjt
+            else:
+                uih_features = samples.uih_features_kjt.to(self.device)
+                candidates_features = samples.candidates_features_kjt.to(self.device)
             (
                 seq_embeddings,
                 payload_features,
@@ -506,6 +539,8 @@ class ModelFamilyDenseSingleWorker:
         self.rank = dist.get_rank()       # 当前进程的 rank
         self.world_size = dist.get_world_size()  # 总进程数
         gpu_count = torch.cuda.device_count()  # 当前节点 GPU 数量
+        self.dense_times = []
+        self.htod_times = []
         # 将 rank 映射到 GPU
         self.device = torch.device(f"cuda:{self.rank % gpu_count}")
         torch.cuda.set_device(self.device)
@@ -529,6 +564,32 @@ class ModelFamilyDenseSingleWorker:
         assert self.model is not None
         self.model.eval()
 
+    def report_dense_latency_stats(self):
+        if not self.dense_times:
+            logger.info("No dense timing data collected yet.")
+            return
+
+        arr = np.array(self.dense_times)
+        median = np.percentile(arr, 50)
+        p99 = np.percentile(arr, 99)
+
+        logger.info(
+            f"[dense][rank:{self.rank}] stats: median={median:.3f} ms, p99={p99:.3f} ms (n={len(arr)})"
+        )
+
+    def report_htod_latency_stats(self):
+        if not self.htod_times:
+            logger.info("No dense timing data collected yet.")
+            return
+
+        arr = np.array(self.htod_times)
+        median = np.percentile(arr, 50)
+        p99 = np.percentile(arr, 99)
+
+        logger.info(
+            f"[dense htod][rank:{self.rank}] stats: median={median:.3f} ms, p99={p99:.3f} ms (n={len(arr)})"
+        )
+
     def predict(
         self,
         seq_embeddings: Optional[Dict[str, SequenceEmbedding]],
@@ -548,8 +609,8 @@ class ModelFamilyDenseSingleWorker:
             and seq_embeddings is not None
         )
         with torch.profiler.record_function("dense forward"):
+            # logger.info(f"rank:{self.rank} before move_sparse_output_to_device")
             t0 = time.perf_counter()
-            logger.info(f"rank:{self.rank} before move_sparse_output_to_device")
             seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
                 move_sparse_output_to_device(
                     seq_embeddings=seq_embeddings,
@@ -559,7 +620,12 @@ class ModelFamilyDenseSingleWorker:
                     device=self.device,
                 )
             )
-            logger.info(f"rank:{self.rank} main_forward start")
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self.htod_times.append(dt_ms)
+            logger.info(f"[dense htod]rank:{self.rank} forward took {dt_ms:.3f} ms")
+            self.report_htod_latency_stats()
+            # logger.info(f"rank:{self.rank} main_forward start")
+            t2 = time.perf_counter()
             assert self.model is not None
             (
                 _,
@@ -576,8 +642,11 @@ class ModelFamilyDenseSingleWorker:
                 max_num_candidates=max_num_candidates,
                 num_candidates=num_candidates,
             )
-            dt_ms = (time.perf_counter() - t0) * 1000.0
+            dt_ms = (time.perf_counter() - t2) * 1000.0
+            self.dense_times.append(dt_ms)
             logger.info(f"[dense]rank:{self.rank} forward took {dt_ms:.3f} ms")
+            self.report_dense_latency_stats()
+
             assert mt_target_preds is not None
             mt_target_preds = mt_target_preds.detach().to(
                 device="cpu", non_blocking=True
