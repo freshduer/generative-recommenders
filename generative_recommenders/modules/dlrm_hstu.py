@@ -449,14 +449,25 @@ class DlrmHSTU(HammerModule):
             torch.ops.fbgemm.asynchronous_complete_cumsum(num_candidates)
         )
 
-        seq_embeddings = {
-            k: SequenceEmbedding(
-                lengths=seq_embeddings_dict[k].lengths(),
-                embedding=seq_embeddings_dict[k].values(),
-            )
-            for k in self._hstu_configs.user_embedding_feature_names
+        # 兼容两种 embedding_collection 输出：
+        # 1) TorchRec 默认: 返回具有 .lengths() / .values() 接口的对象
+        # 2) 自定义实现 (custom_sharding.CustomEmbeddingCollection): 返回 Dict[str, Tensor]
+        seq_embeddings: Dict[str, SequenceEmbedding] = {}
+        feature_names = (
+            self._hstu_configs.user_embedding_feature_names
             + self._hstu_configs.item_embedding_feature_names
-        }
+        )
+        for k in feature_names:
+            raw_val = seq_embeddings_dict[k]
+            if hasattr(raw_val, "lengths") and hasattr(raw_val, "values"):
+                lengths = raw_val.lengths()
+                embedding = raw_val.values()
+            else:
+                # 自定义 collection 情况: raw_val 已是 [total_length, D] Tensor
+                embedding = raw_val
+                # 从原始 merged_sparse_features 取该特征的 lengths
+                lengths = merged_sparse_features[k].lengths()
+            seq_embeddings[k] = SequenceEmbedding(lengths=lengths, embedding=embedding)
         for k, v in seq_embeddings.items():
             print(f"{k}: embedding.shape={v.embedding.shape}, lengths.shape={v.lengths.shape}")
 

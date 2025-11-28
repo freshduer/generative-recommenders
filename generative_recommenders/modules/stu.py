@@ -251,6 +251,22 @@ class STULayer(STU):
         self.kv_caching_offsets = None
         self.max_kv_caching_len = 0
 
+    def log_kv_cache_size(self, prefix: str = "") -> None:
+        """打印 KV Cache 当前占用大小（元素与字节）。"""
+        if self.k_cache is None or self.v_cache is None:
+            print(f"[KV][{prefix}] empty k_cache/v_cache")
+            return
+        k_elems = self.k_cache.numel()
+        v_elems = self.v_cache.numel()
+        k_bytes = k_elems * self.k_cache.element_size()
+        v_bytes = v_elems * self.v_cache.element_size()
+        total_bytes = k_bytes + v_bytes
+        mb = total_bytes / (1024 * 1024)
+        print(
+            f"[KV][{prefix}] k_shape={tuple(self.k_cache.shape)} v_shape={tuple(self.v_cache.shape)} "
+            f"k_elems={k_elems} v_elems={v_elems} total={k_elems+v_elems} bytes={total_bytes} (~{mb:.2f} MB)"
+        )
+
     def update_kv_cache(
         self,
         max_seq_len: int,
@@ -332,6 +348,7 @@ class STULayer(STU):
             max_kv_caching_len=max_kv_caching_len,
             kv_caching_lengths=kv_caching_lengths,
         )
+        self.log_kv_cache_size(prefix="forward")
 
         with record_function("## stu_compute_output ##"):
             return hstu_compute_output(
@@ -384,6 +401,7 @@ class STULayer(STU):
             max_kv_caching_len=max_kv_caching_len,
             kv_caching_lengths=kv_caching_lengths,
         )
+        self.log_kv_cache_size(prefix="cached_forward")
         k = k.view(-1, self._num_heads, self._attention_dim)
         v = v.view(-1, self._num_heads, self._hidden_dim)
         with record_function("## delta_hstu_mha ##"):

@@ -55,6 +55,7 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.embedding_modules import EmbeddingCollection
+from generative_recommenders.dlrm_v3.inference.custom_sharding import CustomEmbeddingCollection
 
 import logging
 logging.basicConfig()
@@ -71,6 +72,13 @@ def init_distributed(rank: int, world_size: int, backend: str = "nccl"):
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
     return dist.group.WORLD
+
+def log_gpu_memory(prefix=""):
+    free, total = torch.cuda.mem_get_info()
+    used = total - free
+    logger.info(
+        f"{prefix} GPU Mem: used={used/1024**3:.2f} GB, free={free/1024**3:.2f} GB, total={total/1024**3:.2f} GB"
+    )
 
 class HSTUModelFamily:
     def __init__(
@@ -116,6 +124,7 @@ class HSTUModelFamily:
         return "model-family-hstu"
 
     def load(self, model_path: str) -> None:
+        log_gpu_memory(prefix=f"Before init sparse:")
         self.sparse.load(model_path=model_path)
         self.dense.load(model_path=model_path)
 
@@ -148,6 +157,7 @@ class ModelFamilySparseDist:
         hstu_config: DlrmHSTUConfig,
         table_config: Dict[str, EmbeddingConfig],
         constraints: Dict[str, ParameterConstraints],
+        quant: bool = False,
     ) -> None:
         super(ModelFamilySparseDist, self).__init__()
         self.hstu_config = hstu_config
@@ -159,17 +169,25 @@ class ModelFamilySparseDist:
         logger.info(f"[rank {self.rank}] local_size: {get_local_size()}")
         self.constraints = constraints
         self.module = None
+        self.quant: bool = quant
     
     def _load_single_sparse(self,model_path):
-        sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
-            table_config=self.table_config,
-            hstu_config=self.hstu_config,
+        logger.info(f"[rank {self.rank}] Using CustomEmbeddingCollection manual sharding")
+        custom_ec = CustomEmbeddingCollection(
+            table_config={cfg.name: cfg for cfg in self.table_config.values()},
+            constraints=self.constraints,
+            device=torch.device("cuda")
         )
-        load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
-        sparse_arch.eval()
         if self.quant:
+            self.sparse_arch = HSTUSparseInferenceModule(
+                table_config=self.table_config,
+                hstu_config=self.hstu_config,
+                embedding_collection=custom_ec,
+            ).to(self.device)
+            self.sparse_arch.eval()
+            load_sparse_checkpoint(model=self.sparse_arch._hstu_model, path=model_path)
             self.module = quant.quantize_dynamic(
-                sparse_arch,
+                self.sparse_arch,
                 qconfig_spec={
                     torchrec.EmbeddingCollection: QuantConfig(
                         activation=quant.PlaceholderObserver.with_args(
@@ -184,7 +202,11 @@ class ModelFamilySparseDist:
                 inplace=False,
             )
         else:
-            self.module = sparse_arch
+            self.module = HSTUSparseInferenceModule(
+                table_config=self.table_config,
+                hstu_config=self.hstu_config,
+                embedding_collection=custom_ec,
+            ).to(self.device)
         print(f"sparse module is {self.module}")
 
     def _load_distributed_sparse(self, 
@@ -192,7 +214,6 @@ class ModelFamilySparseDist:
     ) -> None:
         # 环境变量控制是否启用自定义分片
         # if os.environ.get("CUSTOM_SHARDING", "0") == "1":
-        from generative_recommenders.dlrm_v3.inference.custom_sharding import CustomEmbeddingCollection
         logger.info(f"[rank {self.rank}] Using CustomEmbeddingCollection manual sharding")
         custom_ec = CustomEmbeddingCollection(
             table_config={cfg.name: cfg for cfg in self.table_config.values()},

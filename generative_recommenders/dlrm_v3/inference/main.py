@@ -15,12 +15,38 @@
 # pyre-strict
 """
 mlperf dlrm_v3 inference benchmarking tool.
+
+Added segmented GPU memory logging to identify where large allocations occur
+prior to explicit model initialization.
 """
+
+# Minimal early import for memory baseline
+import torch as _torch_early
+import logging
+def _mem(tag: str):
+    try:
+        _torch_early.cuda.init()
+        _torch_early.cuda.synchronize()
+        alloc = _torch_early.cuda.memory_allocated()/1024**2
+        reserved = _torch_early.cuda.memory_reserved()/1024**2
+        free,total = _torch_early.cuda.mem_get_info()
+        _logger_mem = logging.getLogger("mem")
+        if not _logger_mem.handlers:
+            logging.basicConfig(level=logging.INFO)
+        _logger_mem.info(f"[MEM][{tag}] alloc={alloc:.1f}MB reserved={reserved:.1f}MB used={(total-free)/1024**2:.1f}MB total={total/1024**2:.1f}MB")
+    except Exception as _e:
+        _logger_mem = logging.getLogger("mem")
+        if not _logger_mem.handlers:
+            logging.basicConfig(level=logging.INFO)
+        _logger_mem.exception(f"[MEM][{tag}] error: {_e}")
+
+_mem("A_start_before_heavy_imports")
 
 import argparse
 import array
 import json
 import logging
+_mem("B_after_stdlib_imports")
 
 logging.basicConfig(level=logging.INFO)
 import math
@@ -30,11 +56,13 @@ import time
 from typing import Any, Dict, List, Optional, Union
 
 import gin
+_mem("C_after_gin")
 
 # pyre-ignore [21]
 import mlperf_loadgen as lg  # @manual
 import numpy as np
 import torch
+_mem("D_after_core_mlperf_numpy_torch")
 from generative_recommenders.common import set_dev_mode, set_verbose_level
 from generative_recommenders.dlrm_v3.configs import (
     get_embedding_table_config,
@@ -54,6 +82,7 @@ from generative_recommenders.dlrm_v3.utils import (
     profiler_or_nullcontext,
     SUPPORTED_DATASETS,
 )
+_mem("E_after_project_module_imports")
 
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import (
@@ -63,6 +92,7 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 import torch.distributed as dist
+_mem("F_after_torch_distributed")
 
 logger: logging.Logger = logging.getLogger("main")
 
@@ -273,6 +303,13 @@ def gen_constraints_from_table_config(
         )
     return constraints
 
+def log_gpu_memory(prefix=""):
+    free, total = torch.cuda.mem_get_info()
+    used = total - free
+    logger.info(
+        f"{prefix} GPU Mem: used={used/1024**3:.2f} GB, free={free/1024**3:.2f} GB, total={total/1024**3:.2f} GB"
+    )
+
 @gin.configurable
 def run(
     dataset: str = "debug",
@@ -298,11 +335,13 @@ def run(
     dataset_percentage: float = 1.0,
     torch_random_seed: int = 42,
 ) -> None:
+    log_gpu_memory(prefix="Before run:")
     set_dev_mode(dev_mode)
     if scenario_name not in SCENARIO_MAP:
         raise NotImplementedError("valid scanarios:" + str(list(SCENARIO_MAP.keys())))
     np.random.seed(numpy_rand_seed)
     # torch.manual_seed(torch_random_seed)
+    log_gpu_memory(prefix="Before dist init:")
     dist.init_process_group(backend="nccl")
 
     hstu_config = get_hstu_configs(dataset)
@@ -328,6 +367,7 @@ def run(
     except Exception:
         logger.exception("打印 constraints 失败")
 
+    log_gpu_memory(prefix="Before model_family init:")
     model_family = HSTUModelFamily(
         hstu_config=hstu_config,
         table_config=table_config,
@@ -477,6 +517,7 @@ def run(
 
 
 def main() -> None:
+    log_gpu_memory(prefix="after main:")
     set_verbose_level(1)
     args = get_args()
     logger.info(args)
