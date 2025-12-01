@@ -14,7 +14,7 @@
 #SBATCH --nodes=1
 
 # 请求的 GPU 数量
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
 #SBATCH -w gpu26
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=logs-kv/%x_%j.out
+#SBATCH --error=logs-kv/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -79,12 +79,36 @@ export NCCL_DEBUG=INFO
 export NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-torchrun --nproc_per_node=2 main.py
+## hstu
+# torchrun --nproc_per_node=2 main.py
 
-##test
+## shard
 # torchrun --nproc_per_node=2 test_custom_sharding.py
 # torchrun --nproc_per_node=2 benchmark/b_emb1.py
 # torchrun --nproc_per_node=1 benchmark/b_emb2.py
+
+## test fbgem
+# python benchmark/check_fbgemm_async_cumsum.py --lengths 3 5 2 4
+
+## profile STU
+python benchmark/profile_stustack_kvcache.py --phase both --logdir ./stu_traces
+
+
+## STU kv cache
+# python benchmark/benchmark_stustack_kvcache.py \
+#   --device cuda \
+#   --kernel triton \
+#   --dtype float16 \
+#   --batch-size 1 \
+#   --num-layers 8 \
+#   --num-heads 4 \
+#   --embedding-dim 256 \
+#   --attention-dim 64 \
+#   --hidden-dim 128 \
+#   --max-uih-len 10000 \
+#   --delta-size 64 \
+#   --warmup 2 \
+#   --iters 20
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活

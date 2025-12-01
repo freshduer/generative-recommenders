@@ -36,6 +36,7 @@ try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
 except OSError:
     pass
+import fbgemm_gpu
 
 
 class STU(HammerModule, abc.ABC):
