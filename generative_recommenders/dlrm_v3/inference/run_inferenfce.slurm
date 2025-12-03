@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu26
+#SBATCH -w gpu25
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=48
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-kv/%x_%j.out
-#SBATCH --error=logs-kv/%x_%j.err
+#SBATCH --output=logs-embswap/%x_%j.out
+#SBATCH --error=logs-embswap/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -91,7 +91,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # python benchmark/check_fbgemm_async_cumsum.py --lengths 3 5 2 4
 
 ## profile STU
-python benchmark/profile_stustack_kvcache.py --phase both --logdir ./stu_traces
+# python benchmark/profile_stustack_kvcache.py --phase both --logdir ./stu_traces
 
 
 ## STU kv cache
@@ -109,6 +109,15 @@ python benchmark/profile_stustack_kvcache.py --phase both --logdir ./stu_traces
 #   --delta-size 64 \
 #   --warmup 2 \
 #   --iters 20
+
+## STU kv cache with cpu swap
+# python benchmark/benchmark_stustack_kvcache_limit.py \
+#   --num-users 300 --measure-requests 3000 \
+#   --prefill-len 4096 --delta-size 128 \
+#   --limit 5GB --limit 10GB --limit 30GB --limit 60GB \
+#   --seed 2025
+
+## embedding with cpu swap
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活
