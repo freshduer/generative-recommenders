@@ -118,6 +118,14 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 #   --seed 2025
 
 ## embedding with cpu swap
+torchrun --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
+  --batch-size 32 \
+  --warmup-steps 5 \
+  --measure-steps 50 \
+  --num-embeddings 10000000 \
+  --embedding-dim 256 \
+  --limit 2GB --limit 5GB --limit 10GB --limit none \
+  --sharding row_wise
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活
