@@ -17,13 +17,13 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu25
+#SBATCH -w gpu26
 
 # 请求的 CPU 核心数
-#SBATCH --cpus-per-task=48
+#SBATCH --cpus-per-task=64
 
 # 请求的内存
-#SBATCH --mem=300G
+#SBATCH --mem=450G
 
 # 设置最长运行时间
 #SBATCH --time=01:00:00
@@ -79,6 +79,13 @@ export NCCL_DEBUG=INFO
 export NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
+# 动态选择一个可用端口，避免与已有作业冲突
+if [ -z "${MASTER_PORT}" ]; then
+    MASTER_PORT=$(shuf -i 20000-29999 -n 1)
+    export MASTER_PORT
+fi
+echo "MASTER_PORT set to ${MASTER_PORT}"
+
 ## hstu
 # torchrun --nproc_per_node=2 main.py
 
@@ -118,14 +125,18 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 #   --seed 2025
 
 ## embedding with cpu swap
-torchrun --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
-  --batch-size 32 \
+torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
+  --batch-size 16 \
   --warmup-steps 5 \
-  --measure-steps 50 \
-  --num-embeddings 10000000 \
+  --measure-steps 100 \
+  --num-embeddings 60000000 \
   --embedding-dim 256 \
-  --limit 2GB --limit 5GB --limit 10GB --limit none \
-  --sharding row_wise
+  --limit 2GB --limit 5GB --limit 10GB --limit 20GB  --limit 30GB  --limit 40GB \
+  --limit 50GB --limit unlimited \
+  --sharding row_wise \
+  --prebuilt-pin-memory \
+  --include-cpu-baseline \
+  --resample-per-step
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活

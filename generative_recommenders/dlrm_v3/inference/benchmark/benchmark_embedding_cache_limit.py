@@ -67,12 +67,15 @@ class BenchConfig:
     batch_size: int = 32
     warmup_steps: int = 5
     measure_steps: int = 50
-    num_embeddings: int = 20_000_000
+    num_embeddings: int = 60_000_000
     embedding_dim: int = 256
-    hot_ratio: float = 0.20
-    access_ratio: float = 0.80
-    prefill_ratio: float = 0.20
+    hot_ratio: float = 0.10
+    access_ratio: float = 0.90
+    prefill_ratio: float = 0.10
     seed: int = 1337
+    prebuilt_chunk_rows: int = 5_000_000
+    prebuilt_pin_memory: bool = False
+    resample_per_step: bool = False
 
 
 @dataclass
@@ -168,8 +171,9 @@ def _maybe_init_dist(backend: str, local_rank: int) -> Tuple[bool, int, int]:
     world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
     should_init = world_size_env > 1 or os.environ.get("MASTER_ADDR") is not None
     if should_init:
+        print("[benchmark] initializing torch.distributed...")
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
+        os.environ.setdefault("MASTER_PORT", "29501")
         try:
             dist.init_process_group(backend=backend, device_id=local_rank)
         except TypeError:
@@ -482,6 +486,149 @@ def _prefill_from_batch(
     return mapping
 
 
+def _expand_prefill_to_budget(
+    prefill: Dict[str, torch.Tensor],
+    tables: Dict[str, EmbeddingConfig],
+    per_table_cap: Optional[Dict[str, int]],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    if not per_table_cap:
+        return prefill
+    expanded: Dict[str, torch.Tensor] = dict(prefill)
+    for table_name, cap in per_table_cap.items():
+        cfg = tables.get(table_name)
+        if cfg is None:
+            continue
+        target = int(cap or 0)
+        if target <= 0:
+            expanded.pop(table_name, None)
+            continue
+        target = min(target, cfg.num_embeddings)
+        current = expanded.get(table_name)
+        if current is None or current.numel() == 0:
+            expanded[table_name] = torch.arange(0, target, device=device, dtype=torch.long)
+            continue
+        if current.device != device:
+            current = current.to(device)
+        unique_current = torch.unique(current, sorted=True)
+        if unique_current.numel() >= target:
+            expanded[table_name] = unique_current[:target]
+            continue
+        needed = target - unique_current.numel()
+        extras: List[torch.Tensor] = []
+        cursor = 0
+        chunk_size = max(1, min(target, 1_048_576))
+        max_id = cfg.num_embeddings
+        # Fill the remaining slots with the lowest unused IDs while keeping existing hot IDs.
+        while needed > 0 and cursor < max_id:
+            chunk_end = min(cursor + chunk_size, max_id)
+            chunk = torch.arange(cursor, chunk_end, device=device, dtype=torch.long)
+            if unique_current.numel() > 0:
+                start_idx = int(torch.searchsorted(unique_current, unique_current.new_tensor(cursor), right=False).item())
+                end_idx = int(torch.searchsorted(unique_current, unique_current.new_tensor(chunk_end), right=False).item())
+                if end_idx > start_idx:
+                    taken = unique_current[start_idx:end_idx] - cursor
+                    mask = torch.ones(chunk.shape[0], dtype=torch.bool, device=device)
+                    mask[taken.to(torch.long)] = False
+                    chunk = chunk[mask]
+            if chunk.numel() == 0:
+                cursor = chunk_end
+                continue
+            take = min(needed, chunk.numel())
+            extras.append(chunk[:take])
+            needed -= take
+            cursor = chunk_end
+        if extras:
+            extra_ids = torch.cat(extras)
+            combined = torch.cat((unique_current, extra_ids))
+            expanded[table_name] = torch.sort(combined).values[:target]
+        else:
+            expanded[table_name] = unique_current
+    return expanded
+
+
+class NoInitEmbedding(torch.nn.Embedding):
+    """Embedding layer that skips the default weight initialization."""
+
+    def reset_parameters(self) -> None:  # type: ignore[override]
+        # Leave weights uninitialized to avoid the heavy uniform_ fill.
+        return
+
+
+def _touch_embedding_chunks(
+    weight: torch.Tensor,
+    chunk_rows: int,
+    table_name: str,
+    rank: int,
+) -> None:
+    if chunk_rows <= 0 or chunk_rows >= weight.shape[0]:
+        return
+    total_rows = weight.shape[0]
+    total_chunks = math.ceil(total_rows / chunk_rows)
+    log_step = max(1, total_chunks // 5)
+    for chunk_idx, start in enumerate(range(0, total_rows, chunk_rows), 1):
+        end = min(start + chunk_rows, total_rows)
+        _ = weight[start:end]
+        if rank == 0 and (
+            chunk_idx == 1
+            or chunk_idx == total_chunks
+            or chunk_idx % log_step == 0
+        ):
+            print(
+                f"[benchmark] prebuilt chunk | table={table_name} "
+                f"chunk={chunk_idx}/{total_chunks} rows={end - start}"
+            )
+
+
+def _build_prebuilt_embeddings(
+    tables_config: Dict[str, EmbeddingConfig],
+    device: torch.device,
+    sharding: ShardingType,
+    rank: int,
+    cfg: BenchConfig,
+) -> Dict[str, torch.nn.Embedding]:
+    prebuilt: Dict[str, torch.nn.Embedding] = {}
+    total_tables = len(tables_config)
+    for idx, (name, table_cfg) in enumerate(tables_config.items(), 1):
+        if sharding != ShardingType.ROW_WISE:
+            continue
+        raw_dtype = getattr(table_cfg, "data_type", DataType.FP16)
+        if hasattr(raw_dtype, "name"):
+            dtype_token = getattr(raw_dtype, "name")
+        else:
+            dtype_token = str(raw_dtype)
+        if str(dtype_token).lower() in {"fp16", "half", "float16"}:
+            target_dtype = torch.float16
+        elif str(dtype_token).lower() in {"bf16", "bfloat16"}:
+            target_dtype = torch.bfloat16
+        else:
+            target_dtype = torch.float32
+        emb = NoInitEmbedding(
+            table_cfg.num_embeddings,
+            table_cfg.embedding_dim,
+            device=torch.device("cpu"),
+            dtype=target_dtype,
+        )
+        emb.weight.requires_grad_(False)
+        weight = emb.weight.detach()
+        if getattr(cfg, "prebuilt_pin_memory", False) and torch.cuda.is_available():
+            weight = weight.pin_memory()
+        emb.weight = torch.nn.Parameter(weight, requires_grad=False)
+        _touch_embedding_chunks(
+            emb.weight,
+            max(0, getattr(cfg, "prebuilt_chunk_rows", 0)),
+            name,
+            rank,
+        )
+        prebuilt[name] = emb
+        if rank == 0 and idx <= total_tables:
+            print(
+                f"[benchmark] prebuilt embeddings | table={name} ({idx}/{total_tables}) "
+                f"rows={table_cfg.num_embeddings} dim={table_cfg.embedding_dim}"
+            )
+    return prebuilt
+
+
 def benchmark_limit(
     cfg: BenchConfig,
     limit: BenchmarkLimit,
@@ -489,6 +636,8 @@ def benchmark_limit(
     feature_vocab_sizes: Dict[str, int],
     device: torch.device,
     sharding: ShardingType,
+    prebuilt_tables: Optional[Dict[str, torch.nn.Embedding]] = None,
+    enable_cache: bool = True,
 ) -> Optional[Dict[str, float]]:
     if dist.is_available() and dist.is_initialized():
         rank = dist.get_rank()
@@ -499,7 +648,10 @@ def benchmark_limit(
         world_size = 1
         dist_enabled = False
     if rank == 0:
-        print(f"[benchmark] === limit={limit.label} | sharding={sharding.value} | world_size={world_size} ===")
+        if enable_cache:
+            print(f"[benchmark] === limit={limit.label} | sharding={sharding.value} | world_size={world_size} ===")
+        else:
+            print(f"[benchmark] === CPU baseline (cache disabled) | world_size={world_size} ===")
         _log_device_memory("before_model", device)
     torch.manual_seed(cfg.seed)
     if device.type == "cuda":
@@ -554,18 +706,30 @@ def benchmark_limit(
     if effective_limit_bytes is not None and effective_limit_bytes <= 0:
         effective_limit_bytes = None
     constraints = {name: ParameterConstraints(sharding_types=[sharding.value]) for name in tables_config.keys()}
+    if rank == 0:
+        print("[benchmark] initializing embedding collection (allocating CPU weights & GPU caches)...")
     model = CustomEmbeddingCollection(
         table_config=tables_config,
         constraints=constraints,
         device=device,
         embedding_budget_bytes=effective_limit_bytes,
+        prebuilt_tables=prebuilt_tables,
+        cache_enabled=enable_cache,
     )
-    generator = _torch_generator(device, cfg.seed + rank)
-    batch_kjt = get_kjt_batch(cfg.batch_size, device, feature_vocab_sizes, cfg, generator)
     if rank == 0:
-        kjt_keys = batch_kjt.keys()
+        print("[benchmark] embedding collection ready")
+        print("[benchmark] constructing synthetic batch...")
+    generator = _torch_generator(device, cfg.seed + rank)
+
+    def sample_batch() -> KeyedJaggedTensor:
+        return get_kjt_batch(cfg.batch_size, device, feature_vocab_sizes, cfg, generator)
+
+    base_batch = sample_batch()
+    if rank == 0:
+        print("[benchmark] synthetic batch ready")
+        kjt_keys = base_batch.keys()
         key_count = len(kjt_keys) if isinstance(kjt_keys, list) else len(list(kjt_keys))
-        total_values = int(batch_kjt.values().numel()) if hasattr(batch_kjt, "values") else 0
+        total_values = int(base_batch.values().numel()) if hasattr(base_batch, "values") else 0
         print(
             f"[benchmark] batch ready | keys={key_count} total_values={total_values} "
             f"batch_size={cfg.batch_size}"
@@ -574,12 +738,13 @@ def benchmark_limit(
         effective_limit_bytes is not None
         and effective_limit_bytes > 0
         and device.type == "cuda"
+        and enable_cache
     ):
         if rank == 0:
             print(f"[benchmark] preloading hot ids ratio={cfg.prefill_ratio}")
         preload_start = time.perf_counter()
         observed_prefill = _prefill_from_batch(
-            batch_kjt,
+            base_batch,
             tables_config,
             cfg.prefill_ratio,
             device,
@@ -589,14 +754,38 @@ def benchmark_limit(
             observed_prefill = _prefill_range_map(tables_config, cfg.prefill_ratio, device)
             if rank == 0:
                 print("[benchmark] preload_fallback=range_map (no ids from batch)")
+        observed_prefill = _expand_prefill_to_budget(
+            observed_prefill,
+            tables_config,
+            per_table_prefill_cap,
+            device,
+        )
+        if rank == 0 and per_table_prefill_cap:
+            print("[benchmark] preload adjusted to fill cache budget per table")
         preload_counts = {name: tensor.numel() for name, tensor in observed_prefill.items()}
-        chunk_size = max(1, 200_000)
         for table_name, ids in observed_prefill.items():
+            row_bytes = max(row_size_bytes.get(table_name, cfg.embedding_dim * 2), 1)
+            target_chunk_bytes = 128 * 1024**2
+            chunk_size = max(1, min(ids.numel(), target_chunk_bytes // row_bytes))
             splits = ids.split(chunk_size)
-            for chunk in splits:
+            num_chunks = len(splits)
+            milestones = {1, num_chunks}
+            step = max(1, num_chunks // 5)
+            for m in range(step, num_chunks, step):
+                milestones.add(m)
+            processed = 0
+            for idx, chunk in enumerate(splits, 1):
                 if chunk.numel() == 0:
                     continue
                 model.preload_hot_ids({table_name: chunk.contiguous()})
+                processed += chunk.numel()
+                if rank == 0:
+                    if idx in milestones or processed >= preload_counts[table_name]:
+                        pct = processed / max(preload_counts[table_name], 1)
+                        print(
+                            f"[benchmark] preload progress | table={table_name} "
+                            f"chunk={idx}/{num_chunks} loaded={processed}/{preload_counts[table_name]} ({pct:.1%})"
+                        )
         if rank == 0:
             preload_elapsed = time.perf_counter() - preload_start
             preload_bytes = {
@@ -622,7 +811,8 @@ def benchmark_limit(
         for step in range(cfg.warmup_steps):
             if rank == 0:
                 print(f"[benchmark] warmup step {step + 1}/{cfg.warmup_steps}")
-            model(batch_kjt)
+            current_batch = sample_batch() if cfg.resample_per_step else base_batch
+            model(current_batch)
         if rank == 0:
             print(f"[benchmark] warmup elapsed={time.perf_counter() - warmup_start:.3f}s")
             _log_device_memory("after_warmup", device)
@@ -635,8 +825,9 @@ def benchmark_limit(
         for step in range(cfg.measure_steps):
             if device.type == "cuda":
                 torch.cuda.synchronize()
+            current_batch = sample_batch() if cfg.resample_per_step else base_batch
             t0 = time.perf_counter()
-            model(batch_kjt)
+            model(current_batch)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             latencies.append(time.perf_counter() - t0)
@@ -694,7 +885,12 @@ def benchmark_limit(
     }
 
 
-def run_benchmark(cfg: BenchConfig, limits: Sequence[BenchmarkLimit], sharding: ShardingType) -> None:
+def run_benchmark(
+    cfg: BenchConfig,
+    limits: Sequence[BenchmarkLimit],
+    sharding: ShardingType,
+    include_cpu_baseline: bool = False,
+) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -708,13 +904,42 @@ def run_benchmark(cfg: BenchConfig, limits: Sequence[BenchmarkLimit], sharding: 
         print("[benchmark] Running in single-process mode (no torch.distributed backend).")
     tables_config = _build_tables_config(cfg)
     feature_vocab_sizes = _feature_vocab_sizes(tables_config)
+    prebuilt_tables: Optional[Dict[str, torch.nn.Embedding]] = None
+    if sharding == ShardingType.ROW_WISE:
+        if rank == 0:
+            print("[benchmark] preparing shared CPU embeddings once for all limits...")
+        prebuilt_tables = _build_prebuilt_embeddings(tables_config, device, sharding, rank, cfg)
     results: List[Dict[str, float]] = []
     for limit in limits:
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
-        summary = benchmark_limit(cfg, limit, tables_config, feature_vocab_sizes, device, sharding)
+        summary = benchmark_limit(
+            cfg,
+            limit,
+            tables_config,
+            feature_vocab_sizes,
+            device,
+            sharding,
+            prebuilt_tables=prebuilt_tables,
+        )
         if rank == 0 and summary is not None:
             results.append(summary)
+    if include_cpu_baseline:
+        cpu_limit = BenchmarkLimit(label="CPU", bytes=0)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        cpu_summary = benchmark_limit(
+            cfg,
+            cpu_limit,
+            tables_config,
+            feature_vocab_sizes,
+            device,
+            sharding,
+            prebuilt_tables=prebuilt_tables,
+            enable_cache=False,
+        )
+        if rank == 0 and cpu_summary is not None:
+            results.append(cpu_summary)
     if rank == 0:
         print("==== Embedding Cache Budget Benchmark ====")
         print(f"world_size: {world_size}, device: {device}, sharding: {sharding.value}")
@@ -745,7 +970,7 @@ def run_benchmark(cfg: BenchConfig, limits: Sequence[BenchmarkLimit], sharding: 
         dist.destroy_process_group()
 
 
-def parse_args() -> Tuple[BenchConfig, List[BenchmarkLimit], ShardingType]:
+def parse_args() -> Tuple[BenchConfig, List[BenchmarkLimit], ShardingType, bool]:
     parser = argparse.ArgumentParser(
         description="Benchmark CustomEmbeddingCollection under GPU embedding cache limits",
     )
@@ -758,6 +983,30 @@ def parse_args() -> Tuple[BenchConfig, List[BenchmarkLimit], ShardingType]:
     parser.add_argument("--access-ratio", type=float, default=BenchConfig.access_ratio)
     parser.add_argument("--prefill-ratio", type=float, default=BenchConfig.prefill_ratio)
     parser.add_argument("--seed", type=int, default=BenchConfig.seed)
+    parser.add_argument(
+        "--resample-per-step",
+        action="store_true",
+        default=BenchConfig.resample_per_step,
+        help="Regenerate synthetic batches for every warmup/measure iteration to emulate streaming traffic.",
+    )
+    parser.add_argument(
+        "--include-cpu-baseline",
+        action="store_true",
+        default=False,
+        help="Run an extra measurement with the GPU cache disabled (pure CPU embedding lookups).",
+    )
+    parser.add_argument(
+        "--prebuilt-chunk-rows",
+        type=int,
+        default=BenchConfig.prebuilt_chunk_rows,
+        help="Chunk size (rows) when touching CPU embedding weights; 0 disables chunked progress.",
+    )
+    parser.add_argument(
+        "--prebuilt-pin-memory",
+        action="store_true",
+        default=BenchConfig.prebuilt_pin_memory,
+        help="Pin CPU embedding weights for faster H2D copies (uses extra pinned RAM).",
+    )
     parser.add_argument(
         "--sharding",
         type=str,
@@ -783,6 +1032,9 @@ def parse_args() -> Tuple[BenchConfig, List[BenchmarkLimit], ShardingType]:
         access_ratio=args.access_ratio,
         prefill_ratio=args.prefill_ratio,
         seed=args.seed,
+        prebuilt_chunk_rows=args.prebuilt_chunk_rows,
+        prebuilt_pin_memory=args.prebuilt_pin_memory,
+        resample_per_step=args.resample_per_step,
     )
     raw_limits = args.limits if args.limits is not None else ["none", "10GB", "6GB", "4GB"]
     limits: List[BenchmarkLimit] = []
@@ -792,12 +1044,12 @@ def parse_args() -> Tuple[BenchConfig, List[BenchmarkLimit], ShardingType]:
         except ValueError as exc:
             raise SystemExit(str(exc))
     sharding = ShardingType(args.sharding)
-    return cfg, limits, sharding
+    return cfg, limits, sharding, args.include_cpu_baseline
 
 
 def main() -> None:
-    cfg, limits, sharding = parse_args()
-    run_benchmark(cfg, limits, sharding)
+    cfg, limits, sharding, include_cpu_baseline = parse_args()
+    run_benchmark(cfg, limits, sharding, include_cpu_baseline=include_cpu_baseline)
 
 
 if __name__ == "__main__":

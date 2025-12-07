@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import torch.distributed as dist
 import logging
@@ -93,6 +94,12 @@ class VectorizedEmbeddingCache(torch.nn.Module):
         self.global_tick = 0
         self.filled = 0
 
+        self.register_buffer(
+            "pinned_slots",
+            torch.zeros((max_cache_entries,), dtype=torch.bool, device=device),
+        )
+        self._max_tick_value = torch.iinfo(self.access_tick.dtype).max
+
         # Stats
         self.stats_hits = 0
         self.stats_misses = 0
@@ -103,6 +110,74 @@ class VectorizedEmbeddingCache(torch.nn.Module):
             "slot_to_id",
             torch.full((max_cache_entries,), -1, dtype=torch.long, device=device)
         )
+
+    def _allocate_slots(self, required: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if required <= 0:
+            empty = torch.empty(0, dtype=torch.long, device=self.device)
+            return empty, empty
+        free_capacity = max(self.max_entries - self.filled, 0)
+        allocate_free = min(required, free_capacity)
+        slots = torch.empty(required, dtype=torch.long, device=self.device)
+        free_range = torch.empty(0, dtype=torch.long, device=self.device)
+        if allocate_free > 0:
+            free_range = torch.arange(
+                self.filled,
+                self.filled + allocate_free,
+                device=self.device,
+                dtype=torch.long,
+            )
+            slots[:allocate_free] = free_range
+            self.filled += allocate_free
+        remaining = required - allocate_free
+        evict_slots = torch.empty(0, dtype=torch.long, device=self.device)
+        if remaining > 0:
+            candidate_ticks = torch.where(
+                self.pinned_slots,
+                torch.full_like(self.access_tick, self._max_tick_value),
+                self.access_tick,
+            )
+            _, evict_slots = torch.topk(candidate_ticks, k=remaining, largest=False)
+            slots[allocate_free:] = evict_slots
+            if evict_slots.numel() > 0:
+                self.pinned_slots[evict_slots] = False
+        return slots, evict_slots
+
+    def preload_ids(self, indices: torch.Tensor, cpu_weight: torch.nn.Embedding, *, pin: bool = False) -> None:
+        flat = indices.view(-1)
+        if flat.numel() == 0:
+            return
+        self.global_tick += 1
+        slots = self.mapping_table[flat]
+        hit_mask = slots != -1
+        if hit_mask.any():
+            self.access_tick[slots[hit_mask]] = self.global_tick
+            if pin:
+                self.pinned_slots[slots[hit_mask]] = True
+        miss_mask = ~hit_mask
+        if not miss_mask.any():
+            return
+        miss_indices = flat[miss_mask]
+        num_miss = miss_indices.numel()
+        slots_needed, evict_slots = self._allocate_slots(num_miss)
+        if evict_slots.numel() > 0:
+            old_ids = self.slot_to_id[evict_slots]
+            valid_old = old_ids != -1
+            if valid_old.any():
+                check_ids = old_ids[valid_old]
+                check_slots = evict_slots[valid_old]
+                current_map = self.mapping_table[check_ids]
+                match = current_map == check_slots
+                if match.any():
+                    self.mapping_table[check_ids[match]] = -1
+            self.stats_evictions += evict_slots.numel()
+        idx_cpu = miss_indices.to(cpu_weight.weight.device)
+        fetched = cpu_weight(idx_cpu).to(self.device, non_blocking=True)
+        self.cache_data[slots_needed] = fetched
+        self.mapping_table[miss_indices] = slots_needed
+        self.slot_to_id[slots_needed] = miss_indices
+        self.access_tick[slots_needed] = self.global_tick
+        if pin and slots_needed.numel() > 0:
+            self.pinned_slots[slots_needed] = True
 
     def forward(self, indices: torch.Tensor, cpu_weight: torch.nn.Embedding) -> torch.Tensor:
         """
@@ -137,33 +212,9 @@ class VectorizedEmbeddingCache(torch.nn.Module):
             unique_miss_indices, inverse_map = torch.unique(miss_indices, return_inverse=True)
             num_unique_miss = unique_miss_indices.numel()
 
-            # Allocate free slots first (fast path for initial fills)
-            free_capacity = max(self.max_entries - self.filled, 0)
-            allocate_free = min(num_unique_miss, free_capacity)
-            slots_for_unique = torch.empty(
-                num_unique_miss, dtype=torch.long, device=self.device
-            )
-            if allocate_free > 0:
-                free_range = torch.arange(
-                    self.filled,
-                    self.filled + allocate_free,
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                slots_for_unique[:allocate_free] = free_range
-                self.filled += allocate_free
-            else:
-                free_range = torch.empty(0, dtype=torch.long, device=self.device)
-
-            remaining = num_unique_miss - allocate_free
-            if remaining > 0:
-                # Need to reuse existing slots via LRU
-                _, evict_slots = torch.topk(self.access_tick, k=remaining, largest=False)
-                slots_for_unique[allocate_free:] = evict_slots
-                victim_slots = evict_slots
-                self.stats_evictions += remaining
-            else:
-                victim_slots = torch.empty(0, dtype=torch.long, device=self.device)
+            slots_for_unique, victim_slots = self._allocate_slots(num_unique_miss)
+            if victim_slots.numel() > 0:
+                self.stats_evictions += victim_slots.numel()
 
             # --- CPU Fetch (The expensive part) ---
             # Move indices to CPU, fetch, move back. 
@@ -192,6 +243,10 @@ class VectorizedEmbeddingCache(torch.nn.Module):
 
             # 4. Update LRU Ticks for new slots
             self.access_tick[slots_for_unique] = self.global_tick
+
+            # 4b. New runtime fetches are not pinned by default
+            if slots_for_unique.numel() > 0:
+                self.pinned_slots[slots_for_unique] = False
 
             # 5. Fix the 'slots' variable for the original request so we can gather
             slots[miss_mask] = slots_for_unique[inverse_map]
@@ -291,6 +346,8 @@ class CustomEmbeddingCollection(torch.nn.Module):
         constraints: Optional[Dict[str, ParameterConstraints]] = None,
         device: torch.device = None,
         embedding_budget_bytes: Optional[int] = None,
+        prebuilt_tables: Optional[Dict[str, torch.nn.Embedding]] = None,
+        cache_enabled: bool = True,
     ) -> None:
         super().__init__()
         
@@ -314,12 +371,14 @@ class CustomEmbeddingCollection(torch.nn.Module):
         self.tables: Dict[str, LocalEmbeddingTable] = {}
         self.feature_to_table: Dict[str, str] = {}
         self._constraints = constraints or {}
+        self._prebuilt_tables = prebuilt_tables or {}
         
         # Calculate budget per table (Simple Strategy: Equal split or Proportional?)
         # For simplicity, we assign the full budget check logic loosely, 
         # or assuming the budget is GLOBAL. 
         # Here we split budget equally among tables enabled for caching for simplicity.
-        self.global_budget_bytes = embedding_budget_bytes
+        self.global_budget_bytes = embedding_budget_bytes if cache_enabled else None
+        self.cache_enabled = cache_enabled
         
         # 2. Init Tables
         self.cache_modules = torch.nn.ModuleDict() # To register caches properly
@@ -336,10 +395,21 @@ class CustomEmbeddingCollection(torch.nn.Module):
         # Determine Device & Dtype
         is_offload = sharding_type == ShardingType.CPU_OFFLOAD
         # If cache is enabled (budget > 0), we store master weights on CPU
-        use_cache = (self.global_budget_bytes is not None and local_rows > 0 and self.device.type == "cuda")
+        use_cache = (
+            self.cache_enabled
+            and self.global_budget_bytes is not None
+            and local_rows > 0
+            and self.device.type == "cuda"
+        )
+
+        if not self.cache_enabled:
+            use_cache = False
         
         # Primary storage device
-        storage_device = torch.device("cpu") if (is_offload or use_cache) else self.device
+        use_cpu_master = is_offload
+        if not use_cpu_master and self.device.type == "cuda":
+            use_cpu_master = use_cache or not self.cache_enabled
+        storage_device = torch.device("cpu") if use_cpu_master else self.device
         
         raw_dtype = getattr(cfg, "data_type", "fp32")
         if hasattr(raw_dtype, "value"):
@@ -357,16 +427,26 @@ class CustomEmbeddingCollection(torch.nn.Module):
         else:
             target_dtype = torch.float32
 
-        # Create Master Embedding
-        # Enable pin_memory if on CPU for faster transfer
-        emb_layer = torch.nn.Embedding(local_rows, cfg.embedding_dim, device=storage_device, dtype=target_dtype)
-        if local_rows > 0:
-            torch.nn.init.uniform_(emb_layer.weight, -0.01, 0.01)
-            # Experimental: Pin memory for faster CPU->GPU copy
-            if storage_device.type == "cpu" and torch.cuda.is_available():
-                 # PyTorch nn.Embedding doesn't support .pin_memory() on initialization easily.
-                 # We can manually pin the tensor data.
-                 emb_layer.weight.data = emb_layer.weight.data.pin_memory()
+        # Create or reuse Master Embedding
+        prebuilt = self._prebuilt_tables.get(name)
+        if prebuilt is not None:
+            emb_layer = prebuilt
+            if emb_layer.weight.device != storage_device:
+                cloned = torch.nn.Embedding(
+                    emb_layer.num_embeddings,
+                    emb_layer.embedding_dim,
+                    device=storage_device,
+                    dtype=emb_layer.weight.dtype,
+                )
+                with torch.no_grad():
+                    cloned.weight.copy_(emb_layer.weight.to(storage_device, non_blocking=True))
+                emb_layer = cloned
+        else:
+            emb_layer = torch.nn.Embedding(local_rows, cfg.embedding_dim, device=storage_device, dtype=target_dtype)
+            if local_rows > 0:
+                torch.nn.init.uniform_(emb_layer.weight, -0.01, 0.01)
+        if emb_layer.weight.device.type == "cpu" and torch.cuda.is_available():
+            emb_layer.weight.data = emb_layer.weight.data.pin_memory()
 
         cache_module = None
         if use_cache:
@@ -459,13 +539,62 @@ class CustomEmbeddingCollection(torch.nn.Module):
             local_idx = ShardingUtils.global_to_local(indices, table.sharding_type, table.row_start, table.weight.num_embeddings)
             return table.cache(local_idx, table.weight)
         
-        # No Cache: Move to where weight is
+        # No Cache: fall back to direct embedding lookup
+        if table.weight.num_embeddings > 0:
+            indices = ShardingUtils.global_to_local(
+                indices,
+                table.sharding_type,
+                table.row_start,
+                table.weight.num_embeddings,
+            )
+            if torch.any(indices >= table.weight.num_embeddings):
+                max_idx = int(indices.max().item())
+                print(
+                    f"[custom_sharding] {table.name}: index {max_idx} exceeds local limit {table.weight.num_embeddings}; "
+                    f"row_start={table.row_start} sharding={table.sharding_type}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise RuntimeError(
+                    f"{table.name}: index {max_idx} exceeds local embeddings (limit={table.weight.num_embeddings})"
+                )
+
+        # Move indices to the tensor's home device if needed
         weight_device = table.weight.weight.device
         if weight_device != indices.device:
             idx_remote = indices.to(weight_device, non_blocking=True)
-            embs = table.weight(idx_remote)
+            try:
+                embs = table.weight(idx_remote)
+            except IndexError as exc:
+                self._report_bad_indices(idx_remote, table)
+                raise exc
             return embs.to(self.device, non_blocking=True)
-        return table.weight(indices)
+        try:
+            return table.weight(indices)
+        except IndexError as exc:
+            self._report_bad_indices(indices, table)
+            raise exc
+
+    def _report_bad_indices(self, indices: torch.Tensor, table: LocalEmbeddingTable) -> None:
+        if indices.numel() == 0:
+            return
+        over_limit = indices >= table.weight.num_embeddings
+        if torch.any(over_limit):
+            max_idx = int(indices[over_limit].max().item())
+            min_idx = int(indices[over_limit].min().item())
+            print(
+                f"[custom_sharding] {table.name}: indices {min_idx}..{max_idx} exceed local limit {table.weight.num_embeddings}; "
+                f"row_start={table.row_start} sharding={table.sharding_type}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"[custom_sharding] {table.name}: IndexError but all indices < limit {table.weight.num_embeddings}. "
+                f"Sample indices: min={int(indices.min().item())} max={int(indices.max().item())}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _lookup_distributed(self, global_indices: torch.Tensor, table: LocalEmbeddingTable) -> torch.Tensor:
         # 0. Safety Guard
@@ -588,6 +717,5 @@ class CustomEmbeddingCollection(torch.nn.Module):
                     # Convert to local IDs
                     ids = ids.to(self.device)
                     local_ids = ShardingUtils.global_to_local(ids, table.sharding_type, table.row_start, table.weight.num_embeddings)
-                    # Force a lookup to trigger load
-                    table.cache(local_ids, table.weight)
+                    table.cache.preload_ids(local_ids, table.weight, pin=True)
                     logger.info(f"Preloaded {len(ids)} IDs into table '{name}'")
