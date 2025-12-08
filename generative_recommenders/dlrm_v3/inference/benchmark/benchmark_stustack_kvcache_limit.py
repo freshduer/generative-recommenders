@@ -7,7 +7,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -29,7 +29,7 @@ def _complete_cumsum(lengths: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class BenchConfig:
-    num_layers: int = 6
+    num_layers: int = 8
     num_heads: int = 4
     embedding_dim: int = 256
     attention_dim: int = 64
@@ -40,7 +40,8 @@ class BenchConfig:
     kernel: str = "triton"
     dtype: str = "float16"
     device: Optional[str] = None
-    num_users: int = 64
+    batch_size: int = 16
+    num_users: int = 288
     prefill_len: int = 15000
     delta_size: int = 128
     warmup_requests: int = 128
@@ -107,28 +108,52 @@ class KVCacheManager:
         self.lru[user_id] = None
 
     def capture(self, user_id: int, layers: Sequence[STULayer]) -> None:
-        caches: List[LayerCache] = []
-        cache_device: Optional[torch.device] = None
+        self.capture_batch([user_id], layers)
+
+    def capture_batch(self, user_ids: Sequence[int], layers: Sequence[STULayer]) -> None:
+        if not user_ids:
+            return
+        layer_snapshots: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]] = []
         for layer in layers:
             k_cache = layer.k_cache.detach() if layer.k_cache is not None else None
             v_cache = layer.v_cache.detach() if layer.v_cache is not None else None
             offsets = layer.kv_caching_offsets.detach() if layer.kv_caching_offsets is not None else None
-            caches.append(
-                LayerCache(
-                    k=k_cache,
-                    v=v_cache,
-                    offsets=offsets,
-                    max_len=layer.max_kv_caching_len,
-                )
-            )
-            if k_cache is not None:
-                cache_device = k_cache.device
-        entry_device = cache_device if cache_device is not None else torch.device("cpu")
-        self.entries[user_id] = KVEntry(caches=caches, device=entry_device)
-        self.touch(user_id)
+            layer_snapshots.append((k_cache, v_cache, offsets))
         for layer in layers:
             layer.reset_kv_cache()
-        self._log_gpu_bytes("capture")
+        batch_size = len(user_ids)
+        for idx, user_id in enumerate(user_ids):
+            caches: List[LayerCache] = []
+            cache_device: Optional[torch.device] = None
+            for k_all, v_all, offsets_all in layer_snapshots:
+                if k_all is None or v_all is None or offsets_all is None:
+                    caches.append(LayerCache(k=None, v=None, offsets=None, max_len=0))
+                    continue
+                if offsets_all.shape[0] < batch_size + 1:
+                    raise RuntimeError("kv_caching_offsets shape mismatch for batch capture")
+                start = int(offsets_all[idx].item())
+                end = int(offsets_all[idx + 1].item())
+                length = end - start
+                if length <= 0:
+                    caches.append(LayerCache(k=None, v=None, offsets=None, max_len=0))
+                    continue
+                k_slice = k_all[start:end].detach()
+                v_slice = v_all[start:end].detach()
+                local_offsets = offsets_all[idx : idx + 2] - offsets_all[idx]
+                caches.append(
+                    LayerCache(
+                        k=k_slice,
+                        v=v_slice,
+                        offsets=local_offsets.detach(),
+                        max_len=length,
+                    )
+                )
+                cache_device = k_slice.device
+            entry_device = cache_device if cache_device is not None else torch.device("cpu")
+            self.entries[user_id] = KVEntry(caches=caches, device=entry_device)
+            self.touch(user_id)
+        event = "capture" if len(user_ids) == 1 else "capture_batch"
+        self._log_gpu_bytes(event)
 
     def load_into_layers(self, user_id: int, layers: Sequence[STULayer], device: torch.device) -> None:
         entry = self.entries[user_id]
@@ -144,16 +169,101 @@ class KVCacheManager:
             layer.kv_caching_offsets = cache.offsets
         self.touch(user_id)
 
+    def load_batch_into_layers(self, user_ids: Sequence[int], layers: Sequence[STULayer], device: torch.device) -> None:
+        if not user_ids:
+            return
+        for user_id in user_ids:
+            if user_id not in self.entries:
+                raise KeyError(f"User {user_id} has no cached entry")
+        for layer_idx, layer in enumerate(layers):
+            self.enforce_limit(active_user=user_ids)
+            lengths: List[int] = []
+            max_len = 0
+            total_tokens = 0
+            first_k: Optional[torch.Tensor] = None
+            first_v: Optional[torch.Tensor] = None
+            source_k: List[torch.Tensor] = []
+            source_v: List[torch.Tensor] = []
+            for user_id in user_ids:
+                cache = self.entries[user_id].caches[layer_idx]
+                if cache.k is None or cache.v is None:
+                    raise RuntimeError(f"Missing KV cache for user {user_id} at layer {layer_idx}")
+                length = int(cache.k.shape[0])
+                lengths.append(length)
+                total_tokens += length
+                if length > max_len:
+                    max_len = length
+                if cache.k.device.type == "cuda":
+                    cache_cpu_k = cache.k.to(torch.device("cpu"), non_blocking=True)
+                    cache_cpu_v = cache.v.to(torch.device("cpu"), non_blocking=True)
+                    cache.k = cache_cpu_k
+                    cache.v = cache_cpu_v
+                    cache.offsets = cache.offsets.to(torch.device("cpu")) if cache.offsets is not None else None
+                    self.entries[user_id].device = torch.device("cpu")
+                if first_k is None:
+                    first_k = cache.k
+                if first_v is None:
+                    first_v = cache.v
+                source_k.append(cache.k)
+                source_v.append(cache.v)
+            if total_tokens == 0 or first_k is None or first_v is None:
+                layer.reset_kv_cache()
+                continue
+
+            k_shape = first_k.shape[1:]
+            v_shape = first_v.shape[1:]
+            combined_k = torch.empty((total_tokens, *k_shape), device=device, dtype=first_k.dtype)
+            combined_v = torch.empty((total_tokens, *v_shape), device=device, dtype=first_v.dtype)
+
+            offsets = [0]
+            cursor = 0
+            for idx, user_id in enumerate(user_ids):
+                length = lengths[idx]
+                if length == 0:
+                    offsets.append(cursor)
+                    continue
+                combined_k[cursor : cursor + length].copy_(source_k[idx], non_blocking=True)
+                combined_v[cursor : cursor + length].copy_(source_v[idx], non_blocking=True)
+                cursor += length
+                offsets.append(cursor)
+            layer.k_cache = combined_k
+            layer.v_cache = combined_v
+            layer.max_kv_caching_len = max_len
+            layer.kv_caching_offsets = torch.tensor(offsets, dtype=torch.int64, device=device)
+
+        for user_id in user_ids:
+            entry = self.entries[user_id]
+            entry.device = torch.device("cpu")
+            self.touch(user_id)
+
+    def entry_bytes(self, user_id: int) -> int:
+        entry = self.entries[user_id]
+        total = 0
+        for cache in entry.caches:
+            total += cache.nbytes()
+        return total
+
+    def batch_bytes(self, user_ids: Sequence[int]) -> int:
+        total = 0
+        for user_id in user_ids:
+            total += self.entry_bytes(int(user_id))
+        return total
+
     def _move_entry_to_device(self, user_id: int, device: torch.device) -> None:
         entry = self.entries[user_id]
         if entry.device == device:
             return
         from_device = entry.device
+        before_mb = entry.gpu_bytes() / (1024**2)
         for cache in entry.caches:
             cache.to(device)
         entry.device = device
         if device.type == "cuda" and from_device.type != "cuda":
             self.num_page_ins += 1
+            print(
+                f"[kv-cache] page_in user={user_id} size={entry.gpu_bytes() / (1024**2):.2f} MB (from {before_mb:.2f} MB) "
+                f"total_gpu={self.gpu_bytes() / (1024**2):.2f} MB"
+            )
             self._log_gpu_bytes("page_in")
 
     def _move_entry_to_cpu(self, user_id: int) -> bool:
@@ -161,30 +271,43 @@ class KVCacheManager:
         if entry.device.type == "cpu":
             return False
         cpu_device = torch.device("cpu")
+        freed_mb = entry.gpu_bytes() / (1024**2)
         for cache in entry.caches:
             cache.to(cpu_device)
         entry.device = cpu_device
         self.num_evictions += 1
+        print(
+            f"[kv-cache] evict user={user_id} freed={freed_mb:.2f} MB total_gpu={self.gpu_bytes() / (1024**2):.2f} MB"
+        )
         self._log_gpu_bytes("evict")
         return True
 
     def gpu_bytes(self) -> int:
         return sum(entry.gpu_bytes() for entry in self.entries.values())
 
-    def enforce_limit(self, active_user: Optional[int]) -> None:
+    def enforce_limit(self, active_user: Optional[Union[int, Sequence[int]]]) -> None:
         if self.limit_bytes is None:
             return
+        if active_user is None:
+            active_set: Set[int] = set()
+        elif isinstance(active_user, int):
+            active_set = {active_user}
+        else:
+            active_set = {int(uid) for uid in active_user}
         while self.gpu_bytes() > self.limit_bytes:
             candidate: Optional[int] = None
             # Evict least-recently used users while keeping the active user resident.
             for user_id in self.lru.keys():
-                if user_id == active_user:
+                if user_id in active_set:
                     continue
                 entry = self.entries[user_id]
                 if entry.device.type == "cuda":
                     candidate = user_id
                     break
             if candidate is None:
+                print(
+                    f"[kv-cache] unable to find eviction candidate while over limit {self.limit_bytes / (1024**2):.2f} MB"
+                )
                 break
             self._move_entry_to_cpu(candidate)
 
@@ -236,7 +359,9 @@ class StuService:
         self.device = device
         self.dtype = dtype
         self.layers: List[STULayer] = list(stu._stu_layers)
-        self.delta_targets = torch.full((1,), cfg.delta_size, device=device, dtype=torch.int64)
+        self.batch_size = max(1, cfg.batch_size)
+        self.batch_gpu_margin = 1 * 1024**3  # leave ~1GB headroom on CUDA
+        self.delta_targets = torch.full((self.batch_size,), cfg.delta_size, device=device, dtype=torch.int64)
         self.prefill_lengths = torch.full((1,), cfg.prefill_len, device=device, dtype=torch.int64)
         self.prefill_offsets = _complete_cumsum(self.prefill_lengths)
         self.prefill_targets = torch.zeros_like(self.prefill_lengths)
@@ -277,40 +402,134 @@ class StuService:
         self.manager.enforce_limit(active_user=user_id)
 
     def prefill_all_users(self) -> None:
-        for user_id in range(self.cfg.num_users):
+        total = self.cfg.num_users
+        if total == 0:
+            return
+        log_step = max(1, total // 10)
+        for user_id in range(total):
             self.prefill_user(user_id)
+            progress = user_id + 1
+            if progress % log_step == 0 or progress == total:
+                print(f"[kv-bench] prefill users {progress}/{total}")
 
     def decode_user(self, user_id: int) -> None:
+        self._decode_chunk([user_id])
+
+    def _batch_capacity_bytes(self) -> Optional[int]:
+        candidates: List[int] = []
+        if self.manager.limit_bytes is not None:
+            candidates.append(self.manager.limit_bytes)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                candidates.append(int(free_bytes * 0.9))
+            except RuntimeError:
+                pass
+        if not candidates:
+            return None
+        cap = min(candidates)
+        cap = cap - self.batch_gpu_margin
+        if cap <= 0:
+            return 0
+        return cap
+
+    def _plan_chunks(self, user_ids: Sequence[int]) -> List[List[int]]:
+        ids = [int(uid) for uid in user_ids]
+        if not ids:
+            return []
+        capacity = self._batch_capacity_bytes()
+        if capacity is None:
+            return [ids]
+        if capacity <= 0:
+            return [[uid] for uid in ids]
+        hard_max = max(1, min(self.batch_size, 8))
+        chunks: List[List[int]] = []
+        current: List[int] = []
+        current_bytes = 0
+        for uid in ids:
+            user_bytes = self.manager.entry_bytes(uid)
+            if user_bytes <= 0:
+                user_bytes = max(1, self.cfg.delta_size * self.cfg.embedding_dim * self.cfg.num_layers * 2)
+            if user_bytes >= capacity and not current:
+                chunks.append([uid])
+                continue
+            if current and (current_bytes + user_bytes > capacity or len(current) >= hard_max):
+                chunks.append(current)
+                current = []
+                current_bytes = 0
+            if current and len(current) >= hard_max:
+                chunks.append(current)
+                current = []
+                current_bytes = 0
+            current.append(uid)
+            current_bytes += user_bytes
+            if len(current) >= hard_max:
+                chunks.append(current)
+                current = []
+                current_bytes = 0
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _decode_chunk(self, batch_ids: Sequence[int]) -> None:
+        if not batch_ids:
+            return
+        batch_ids = [int(uid) for uid in batch_ids]
         self._reset_layers()
-        self.manager.load_into_layers(user_id, self.layers, self.device)
-        self.manager.enforce_limit(active_user=user_id)
-        generator = self.generators[user_id]
-        delta = torch.randn(
-            self.cfg.delta_size,
-            self.cfg.embedding_dim,
-            device=self.device,
-            dtype=self.dtype,
-            generator=generator,
-        )
-        self.stu.cached_forward(delta, self.delta_targets)
-        self.manager.capture(user_id, self.layers)
-        self.manager.enforce_limit(active_user=user_id)
+        self.manager.load_batch_into_layers(batch_ids, self.layers, self.device)
+        self.manager.enforce_limit(active_user=batch_ids)
+        deltas: List[torch.Tensor] = []
+        for user_id in batch_ids:
+            generator = self.generators[user_id]
+            deltas.append(
+                torch.randn(
+                    self.cfg.delta_size,
+                    self.cfg.embedding_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                    generator=generator,
+                )
+            )
+        delta_batch = torch.cat(deltas, dim=0)
+        targets = self.delta_targets[: len(batch_ids)]
+        self.stu.cached_forward(delta_batch, targets)
+        self.manager.capture_batch(batch_ids, self.layers)
+        self.manager.enforce_limit(active_user=batch_ids)
 
     def run_requests(
         self,
         request_ids: Sequence[int],
         collect_stats: bool,
         record_latencies: Optional[List[float]] = None,
+        phase: str = "",
     ) -> None:
-        for user_id in request_ids:
-            t0 = time.perf_counter() if record_latencies is not None else 0.0
-            self.decode_user(int(user_id))
-            if collect_stats:
-                self.manager.record_usage()
-            if record_latencies is not None:
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize()
-                record_latencies.append(time.perf_counter() - t0)
+        total = len(request_ids)
+        if total == 0:
+            return
+        label = phase or "request"
+        log_step = max(1, total // 10)
+        processed = 0
+        batch_size = self.batch_size
+        while processed < total:
+            batch_ids = request_ids[processed : processed + batch_size]
+            if not batch_ids:
+                break
+            for chunk in self._plan_chunks(batch_ids):
+                if not chunk:
+                    continue
+                start_time = time.perf_counter() if record_latencies is not None else 0.0
+                self._decode_chunk(chunk)
+                if record_latencies is not None:
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize()
+                    latency = time.perf_counter() - start_time
+                    record_latencies.extend([latency] * len(chunk))
+                if collect_stats:
+                    for _ in chunk:
+                        self.manager.record_usage()
+                processed += len(chunk)
+                if processed % log_step == 0 or processed == total:
+                    print(f"[kv-bench][{label}] processed {processed}/{total}")
 
 
 def _pick_dtype(name: str) -> torch.dtype:
@@ -459,6 +678,7 @@ def run_benchmark(cfg: BenchConfig, limits: List[BenchmarkLimit]) -> None:
     results = []
 
     for limit in limits:
+        print(f"[kv-bench] === limit {limit.label} ({'unlimited' if limit.bytes is None else f'{limit.bytes / (1024**3):.2f} GB'}) ===")
         stu = _build_stu(cfg, device, kernel)
         stu.load_state_dict(base_state)
         manager = KVCacheManager(limit.bytes, device)
@@ -466,8 +686,10 @@ def run_benchmark(cfg: BenchConfig, limits: List[BenchmarkLimit]) -> None:
 
         with torch.inference_mode():
             service.prefill_all_users()
+            print("[kv-bench] prefill complete")
             if cfg.warmup_requests > 0:
-                service.run_requests(warmup_requests, collect_stats=False)
+                print(f"[kv-bench] warmup {cfg.warmup_requests} requests")
+                service.run_requests(warmup_requests, collect_stats=False, phase="warmup")
                 if device.type == "cuda":
                     torch.cuda.synchronize()
 
@@ -484,11 +706,13 @@ def run_benchmark(cfg: BenchConfig, limits: List[BenchmarkLimit]) -> None:
                     measure_requests,
                     collect_stats=True,
                     record_latencies=latencies,
+                    phase="measure",
                 )
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 elapsed = time.perf_counter() - start
                 throughput = len(measure_requests) / max(elapsed, 1e-9)
+                print(f"[kv-bench] measure complete | throughput={throughput:.2f} req/s")
 
         avg_gpu_mb = manager.average_gpu_mb()
         max_gpu_mb = manager.max_gpu_bytes / (1024**2)
@@ -526,8 +750,9 @@ def run_benchmark(cfg: BenchConfig, limits: List[BenchmarkLimit]) -> None:
         )
     )
     print(
-        "users: {users}, prefill_len: {prefill}, delta_size: {delta}, warmup: {warmup}, measure: {measure}".format(
+        "users: {users}, batch: {batch}, prefill_len: {prefill}, delta_size: {delta}, warmup: {warmup}, measure: {measure}".format(
             users=cfg.num_users,
+            batch=cfg.batch_size,
             prefill=cfg.prefill_len,
             delta=cfg.delta_size,
             warmup=cfg.warmup_requests,
@@ -581,6 +806,7 @@ def parse_args() -> Tuple[BenchConfig, List[BenchmarkLimit]]:
     parser.add_argument("--kernel", type=str, default=BenchConfig.kernel, choices=["triton", "pytorch"])
     parser.add_argument("--dtype", type=str, default=BenchConfig.dtype, choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"])
+    parser.add_argument("--batch-size", type=int, default=BenchConfig.batch_size)
     parser.add_argument("--num-users", type=int, default=BenchConfig.num_users)
     parser.add_argument("--prefill-len", type=int, default=BenchConfig.prefill_len)
     parser.add_argument("--delta-size", type=int, default=BenchConfig.delta_size)
@@ -608,6 +834,7 @@ def parse_args() -> Tuple[BenchConfig, List[BenchmarkLimit]]:
         kernel=args.kernel,
         dtype=args.dtype,
         device=args.device,
+        batch_size=args.batch_size,
         num_users=args.num_users,
         prefill_len=args.prefill_len,
         delta_size=args.delta_size,

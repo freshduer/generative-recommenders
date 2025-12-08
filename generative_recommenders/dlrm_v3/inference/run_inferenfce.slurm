@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu26
+#SBATCH -w gpu21
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=64
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-embswap/%x_%j.out
-#SBATCH --error=logs-embswap/%x_%j.err
+#SBATCH --output=logs-kvswap/%x_%j.out
+#SBATCH --error=logs-kvswap/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -106,37 +106,43 @@ echo "MASTER_PORT set to ${MASTER_PORT}"
 #   --device cuda \
 #   --kernel triton \
 #   --dtype float16 \
-#   --batch-size 1 \
+#   --batch-size 16 \
 #   --num-layers 8 \
 #   --num-heads 4 \
 #   --embedding-dim 256 \
 #   --attention-dim 64 \
 #   --hidden-dim 128 \
-#   --max-uih-len 10000 \
+#   --max-uih-len 15000 \
 #   --delta-size 64 \
 #   --warmup 2 \
 #   --iters 20
 
 ## STU kv cache with cpu swap
-# python benchmark/benchmark_stustack_kvcache_limit.py \
-#   --num-users 300 --measure-requests 3000 \
-#   --prefill-len 4096 --delta-size 128 \
-#   --limit 5GB --limit 10GB --limit 30GB --limit 60GB \
-#   --seed 2025
+# KV swap（prefill 与 embedding 相同，decode 匹配短序列体量）
+python benchmark/benchmark_stustack_kvcache_limit.py \
+  --num-users 288 \
+  --prefill-len 15000 \
+  --batch-size 16 \
+  --delta-size 128 \
+  --warmup-requests 200 \
+  --measure-requests 200 \
+  --limit 2GB --limit 5GB --limit 10GB --limit 15GB --limit 20GB --limit 25GB\
+  --limit 30GB --limit 35GB --limit 40GB \
+  --seed 2025
 
 ## embedding with cpu swap
-torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
-  --batch-size 16 \
-  --warmup-steps 5 \
-  --measure-steps 100 \
-  --num-embeddings 60000000 \
-  --embedding-dim 256 \
-  --limit 2GB --limit 5GB --limit 10GB --limit 20GB  --limit 30GB  --limit 40GB \
-  --limit 50GB --limit unlimited \
-  --sharding row_wise \
-  --prebuilt-pin-memory \
-  --include-cpu-baseline \
-  --resample-per-step
+# torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
+#   --batch-size 16 \
+#   --warmup-steps 5 \
+#   --measure-steps 100 \
+#   --num-embeddings 60000000 \
+#   --embedding-dim 256 \
+#   --limit 2GB --limit 5GB --limit 10GB --limit 15GB --limit 20GB --limit 25GB\
+#   --limit 30GB --limit 35GB --limit 40GB \
+#   --sharding row_wise \
+#   --prebuilt-pin-memory \
+#   --include-cpu-baseline \
+#   --resample-per-step
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活
