@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu21
+#SBATCH -w gpu27
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=64
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-simulate/%x_%j.out
-#SBATCH --error=logs-simulate/%x_%j.err
+#SBATCH --output=logs-embswap/%x_%j.out
+#SBATCH --error=logs-embswap/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -145,55 +145,53 @@ echo "MASTER_PORT set to ${MASTER_PORT}"
 #   --measure-requests 512 \
 #   --seed 2025
 
-# embedding with cpu swap
-# torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
-#   --batch-size 16 \
-#   --warmup-steps 5 \
-#   --measure-steps 100 \
-#   --num-embeddings 60000000 \
-#   --embedding-dim 256 \
-#   --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
-#   --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
-#   --sharding row_wise \
-#   --prebuilt-pin-memory \
-#   --include-cpu-baseline \
-#   --resample-per-step
+# embedding with cpu swap (自研 CPU+GPU cache 版本)
+torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_cpu_gpu_cached_embedding_collection.py \
+  --batch-size 8 \
+  --warmup-steps 40 \
+  --measure-steps 100 \
+  --num-embeddings 60000000 \
+  --embedding-dim 256 \
+  --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
+  --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
+  --resample-per-step \
+  # --hot-ids-path /path/to/hot_ids.json  # 可选：外部 hot ids 预热
 
 ## simulate
-python3 simulator/simulate_latency_budget.py \
-    --workload simulator/workload.json \
-    --baseline simulator/baseline.json \
-    --num-gpus 1 \
-    --gpu-mem 40 \
-    --nvlink-bandwidth 150.0 \
-    --sweep "5:35,10:30,20:20" \
-    --out simulator/sim_singlegpu.csv \
-    --plot simulator/sim_singlegpu.png
+# python3 simulator/simulate_latency_budget.py \
+#     --workload simulator/workload.json \
+#     --baseline simulator/baseline.json \
+#     --num-gpus 1 \
+#     --gpu-mem 40 \
+#     --nvlink-bandwidth 150.0 \
+#     --sweep "5:35,10:30,20:20" \
+#     --out simulator/sim_singlegpu.csv \
+#     --plot simulator/sim_singlegpu.png
 
- # NVLink
- python3 simulator/simulate_latency_budget.py \
-  --workload simulator/workload.json \
-  --baseline simulator/baseline.json \
-  --num-gpus 4 \
-  --gpu-mem 40 \
-  --interconnect nvlink \
-  --nvlink-bandwidth 150.0 \
-  --sweep "5:35,10:30,20:20" \
-  --out simulator/sim_calibrated.csv \
-  --plot simulator/sim_calibrated.png
+#  # NVLink
+#  python3 simulator/simulate_latency_budget.py \
+#   --workload simulator/workload.json \
+#   --baseline simulator/baseline.json \
+#   --num-gpus 4 \
+#   --gpu-mem 40 \
+#   --interconnect nvlink \
+#   --nvlink-bandwidth 150.0 \
+#   --sweep "5:35,10:30,20:20" \
+#   --out simulator/sim_calibrated.csv \
+#   --plot simulator/sim_calibrated.png
 
-# PCIe Only (e.g. 4090 集群)
-python3 simulator/simulate_latency_budget.py \
-  --num-gpus 4 \
-  --gpu-mem 40 \
-  --interconnect pcie \
-  --pcie-bandwidth 16.0 \
-  --interconnect-latency-ms 0.6 \
-  --workload simulator/workload.json \
-  --baseline simulator/baseline.json \
-  --sweep "5:35,10:30,20:20,25:15,30:10,35:5" \
-  --out simulator/sim_pcie.csv \
-  --plot simulator/sim_pcie.png
+# # PCIe Only (e.g. 4090 集群)
+# python3 simulator/simulate_latency_budget.py \
+#   --num-gpus 4 \
+#   --gpu-mem 40 \
+#   --interconnect pcie \
+#   --pcie-bandwidth 16.0 \
+#   --interconnect-latency-ms 0.6 \
+#   --workload simulator/workload.json \
+#   --baseline simulator/baseline.json \
+#   --sweep "5:35,10:30,20:20,25:15,30:10,35:5" \
+#   --out simulator/sim_pcie.csv \
+#   --plot simulator/sim_pcie.png
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活
