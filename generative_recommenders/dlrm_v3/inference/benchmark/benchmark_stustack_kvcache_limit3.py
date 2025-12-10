@@ -37,7 +37,7 @@ class BenchConfig:
     num_heads: int = 4
     embedding_dim: int = 256
     attention_dim: int = 64
-    hidden_dim: int = 128
+    hidden_dim: int = 1024
     contextual_seq_len: int = 0
     use_group_norm: bool = False
     causal: bool = True
@@ -366,6 +366,12 @@ class StuService:
         total_recompute_time = 0.0
         total_load_time = 0.0
         total_forward_time = 0.0
+        hit_batch_time = 0.0
+        miss_batch_time = 0.0
+        hit_batch_count = 0
+        miss_batch_count = 0
+        forward_hit_time = 0.0
+        forward_miss_time = 0.0
         
         # 估算容量
         if self.manager.limit_bytes and self.manager.current_bytes > 0 and len(self.manager.entries) > 0:
@@ -405,6 +411,7 @@ class StuService:
             for uid in current_batch:
                 if not self.manager.contains(uid):
                     miss_ids.append(uid)
+            had_miss = len(miss_ids) > 0
             # 在重算前统计真实命中/未命中情况
             if collect_stats:
                 self.manager.total_access += len(current_batch)
@@ -456,12 +463,22 @@ class StuService:
                 torch.cuda.synchronize()
             fwd_end = time.perf_counter()
             total_forward_time += (fwd_end - fwd_start)
+            if had_miss:
+                forward_miss_time += (fwd_end - fwd_start)
+            else:
+                forward_hit_time += (fwd_end - fwd_start)
             
             # 已在前向结束同步，这里无需重复同步
             
             req_end = time.perf_counter()
             # 统计一个 batch 的总耗时（不再除以 batch size）
             latencies.append(req_end - req_start)
+            if had_miss:
+                miss_batch_count += 1
+                miss_batch_time += (req_end - req_start)
+            else:
+                hit_batch_count += 1
+                hit_batch_time += (req_end - req_start)
             # 每批次结束打印简要统计
             print(
                 f"[kv-bench] Batch done at {processed + len(current_batch)}: latency={latencies[-1]*1000:.2f} ms, "
@@ -503,6 +520,12 @@ class StuService:
             "forward_total_ms": total_forward_time * 1000.0,
             "load_total_ms": total_load_time * 1000.0,
             "recompute_total_ms": total_recompute_time * 1000.0,
+            "hit_batches": hit_batch_count,
+            "miss_batches": miss_batch_count,
+            "hit_batch_avg_ms": (hit_batch_time / hit_batch_count * 1000.0) if hit_batch_count else float('nan'),
+            "miss_batch_avg_ms": (miss_batch_time / miss_batch_count * 1000.0) if miss_batch_count else float('nan'),
+            "forward_hit_avg_ms": (forward_hit_time / hit_batch_count * 1000.0) if hit_batch_count else float('nan'),
+            "forward_miss_avg_ms": (forward_miss_time / miss_batch_count * 1000.0) if miss_batch_count else float('nan'),
         }
 
 
@@ -654,6 +677,9 @@ def run_benchmark(cfg: BenchConfig, limits: List[BenchmarkLimit]) -> None:
             print(f"  Hit Rate   : {res['hit_rate']:.2f}%")
             print(f"  Evictions  : {res['evictions']}")
             print(f"  Recomputes : {res['recomputes']}")
+            print(f"  Hit Batches: {res['hit_batches']} (avg {res['hit_batch_avg_ms']:.2f} ms)")
+            print(f"  Miss Batches: {res['miss_batches']} (avg {res['miss_batch_avg_ms']:.2f} ms)")
+            print(f"  Forward Hit Avg: {res['forward_hit_avg_ms']:.2f} ms | Forward Miss Avg: {res['forward_miss_avg_ms']:.2f} ms")
             print("-" * 60, flush=True)
 
             # Per-limit summary table for easier scanning
@@ -695,6 +721,12 @@ def run_benchmark(cfg: BenchConfig, limits: List[BenchmarkLimit]) -> None:
                 "p95_ms": p95_ms,
                 "p99_ms": p99_ms,
                 "avg_ms": res['avg_latency'],
+                "hit_batch_avg_ms": res['hit_batch_avg_ms'],
+                "miss_batch_avg_ms": res['miss_batch_avg_ms'],
+                "forward_hit_avg_ms": res['forward_hit_avg_ms'],
+                "forward_miss_avg_ms": res['forward_miss_avg_ms'],
+                "hit_batches": res['hit_batches'],
+                "miss_batches": res['miss_batches'],
             })
 
         del service
@@ -724,6 +756,19 @@ def run_benchmark(cfg: BenchConfig, limits: List[BenchmarkLimit]) -> None:
         print("-- Latency Averages (ms) --", flush=True)
         for row in overall_rows:
             print(f"{row['limit']:>10} avg={row['avg_ms']:.2f}", flush=True)
+        print("-- Hit/Miss Batch Breakdown --", flush=True)
+        for row in overall_rows:
+            print(
+                f"{row['limit']:>10} hits={row['hit_batches']} avg={row['hit_batch_avg_ms']:.2f} | "
+                f"misses={row['miss_batches']} avg={row['miss_batch_avg_ms']:.2f}",
+                flush=True,
+            )
+        print("-- Forward Stage (ms) --", flush=True)
+        for row in overall_rows:
+            print(
+                f"{row['limit']:>10} hit_fwd={row['forward_hit_avg_ms']:.2f} | miss_fwd={row['forward_miss_avg_ms']:.2f}",
+                flush=True,
+            )
 
 def parse_args():
     parser = argparse.ArgumentParser()

@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu21
+#SBATCH -w gpu20
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=64
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-kvswap/%x_%j.out
-#SBATCH --error=logs-kvswap/%x_%j.err
+#SBATCH --output=logs-kvre/%x_%j.out
+#SBATCH --error=logs-kvre/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -87,7 +87,7 @@ fi
 echo "MASTER_PORT set to ${MASTER_PORT}"
 
 ## hstu
-# torchrun --nproc_per_node=2 main.py
+# torchrun --nproc_per_node=1 main.py
 
 ## shard
 # torchrun --nproc_per_node=2 test_custom_sharding.py
@@ -106,7 +106,7 @@ echo "MASTER_PORT set to ${MASTER_PORT}"
 #   --device cuda \
 #   --kernel triton \
 #   --dtype float16 \
-#   --batch-size 16 \
+#   --batch-size 1 \
 #   --num-layers 8 \
 #   --num-heads 4 \
 #   --embedding-dim 256 \
@@ -117,18 +117,33 @@ echo "MASTER_PORT set to ${MASTER_PORT}"
 #   --warmup 2 \
 #   --iters 20
 
-## STU kv cache with cpu swap
+## STU kv cache with recompute
 # KV swap（prefill 与 embedding 相同，decode 匹配短序列体量）
-python benchmark/benchmark_stustack_kvcache_limit.py \
-  --num-users 288 \
+python benchmark/benchmark_stustack_kvcache_limit3.py \
+  --num-users 200 \
   --prefill-len 15000 \
   --batch-size 16 \
-  --delta-size 128 \
-  --warmup-requests 200 \
-  --measure-requests 200 \
-  --limit 2GB --limit 5GB --limit 10GB --limit 15GB --limit 20GB --limit 25GB\
-  --limit 30GB --limit 35GB --limit 40GB \
+  --delta-size 1 \
+  --warmup-requests 400 \
+  --measure-requests 400 \
+  --stats-interval 30 \
+  --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
+  --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
   --seed 2025
+
+# 模拟热门用户占 10%，每个会话 3~6 个请求，150 个请求后热点整体平移 40。
+# python benchmark/benchmark_stustack_kvcache_recompute.py \
+#   --trace-mode mixture \
+#   --hot-user-ratio 0.01 \
+#   --hot-request-ratio 0.85 \
+#   --session-min-len 3 \
+#   --session-max-len 6 \
+#   --drift-interval 150 \
+#   --drift-shift 40 \
+#   --num-users 512 \
+#   --warmup-requests 128 \
+#   --measure-requests 512 \
+#   --seed 2025
 
 ## embedding with cpu swap
 # torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
@@ -137,8 +152,8 @@ python benchmark/benchmark_stustack_kvcache_limit.py \
 #   --measure-steps 100 \
 #   --num-embeddings 60000000 \
 #   --embedding-dim 256 \
-#   --limit 2GB --limit 5GB --limit 10GB --limit 15GB --limit 20GB --limit 25GB\
-#   --limit 30GB --limit 35GB --limit 40GB \
+#   --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
+#   --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
 #   --sharding row_wise \
 #   --prebuilt-pin-memory \
 #   --include-cpu-baseline \
