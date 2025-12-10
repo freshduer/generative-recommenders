@@ -17,20 +17,20 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu26
+#SBATCH -w gpu28
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=48
 
 # 请求的内存
-#SBATCH --mem=300G
+#SBATCH --mem=500G
 
 # 设置最长运行时间
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-kv/%x_%j.out
-#SBATCH --error=logs-kv/%x_%j.err
+#SBATCH --output=logs/%x_%j_cpu.out
+#SBATCH --error=logs/%x_%j_cpu.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -80,7 +80,7 @@ export NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 ## hstu
-# torchrun --nproc_per_node=2 main.py
+torchrun --nproc_per_node=1 main.py
 
 ## shard
 # torchrun --nproc_per_node=2 test_custom_sharding.py
@@ -91,7 +91,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # python benchmark/check_fbgemm_async_cumsum.py --lengths 3 5 2 4
 
 ## profile STU
-python benchmark/profile_stustack_kvcache.py --phase both --logdir ./stu_traces
+# python benchmark/profile_stustack_kvcache.py --phase both --logdir ./stu_traces
 
 
 ## STU kv cache

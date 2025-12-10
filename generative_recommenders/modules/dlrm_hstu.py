@@ -68,8 +68,8 @@ class SequenceEmbedding(NamedTuple):
 @dataclass
 class DlrmHSTUConfig:
     max_seq_len: int = 16384
-    max_num_candidates: int = 10
-    max_num_candidates_inference: int = 5
+    max_num_candidates: int = 128
+    max_num_candidates_inference: int = 128
     hstu_num_heads: int = 1
     hstu_attn_linear_dim: int = 256
     hstu_attn_qk_dim: int = 128
@@ -143,7 +143,7 @@ class DlrmHSTU(HammerModule):
             # self._embedding_collection: EmbeddingCollection = EmbeddingCollection(
             #     tables=list(embedding_tables.values()),
             #     need_indices=False,
-            #     device=torch.device("meta"),
+            #     device=torch.device("cpu"),
             # )
             self._embedding_collection = embedding_collection
 

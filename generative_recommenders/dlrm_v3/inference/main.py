@@ -315,7 +315,7 @@ def run(
     dataset: str = "debug",
     model_path: str = "",
     scenario_name: str = "Server",
-    batchsize: int = 16,
+    batchsize: int = 8,
     out_dir: str = "",
     output_trace: bool = False,
     data_producer_threads: int = 4,
