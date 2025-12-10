@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu20
+#SBATCH -w gpu21
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=64
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-kvre/%x_%j.out
-#SBATCH --error=logs-kvre/%x_%j.err
+#SBATCH --output=logs-simulate/%x_%j.out
+#SBATCH --error=logs-simulate/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -119,17 +119,17 @@ echo "MASTER_PORT set to ${MASTER_PORT}"
 
 ## STU kv cache with recompute
 # KV swap（prefill 与 embedding 相同，decode 匹配短序列体量）
-python benchmark/benchmark_stustack_kvcache_limit3.py \
-  --num-users 200 \
-  --prefill-len 15000 \
-  --batch-size 16 \
-  --delta-size 1 \
-  --warmup-requests 400 \
-  --measure-requests 400 \
-  --stats-interval 30 \
-  --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
-  --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
-  --seed 2025
+# python benchmark/benchmark_stustack_kvcache_limit3.py \
+#   --num-users 200 \
+#   --prefill-len 15000 \
+#   --batch-size 16 \
+#   --delta-size 1 \
+#   --warmup-requests 400 \
+#   --measure-requests 400 \
+#   --stats-interval 30 \
+#   --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
+#   --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
+#   --seed 2025
 
 # 模拟热门用户占 10%，每个会话 3~6 个请求，150 个请求后热点整体平移 40。
 # python benchmark/benchmark_stustack_kvcache_recompute.py \
@@ -145,7 +145,7 @@ python benchmark/benchmark_stustack_kvcache_limit3.py \
 #   --measure-requests 512 \
 #   --seed 2025
 
-## embedding with cpu swap
+# embedding with cpu swap
 # torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_embedding_cache_limit.py \
 #   --batch-size 16 \
 #   --warmup-steps 5 \
@@ -158,6 +158,42 @@ python benchmark/benchmark_stustack_kvcache_limit3.py \
 #   --prebuilt-pin-memory \
 #   --include-cpu-baseline \
 #   --resample-per-step
+
+## simulate
+python3 simulator/simulate_latency_budget.py \
+    --workload simulator/workload.json \
+    --baseline simulator/baseline.json \
+    --num-gpus 1 \
+    --gpu-mem 40 \
+    --nvlink-bandwidth 150.0 \
+    --sweep "5:35,10:30,20:20" \
+    --out simulator/sim_singlegpu.csv \
+    --plot simulator/sim_singlegpu.png
+
+ # NVLink
+ python3 simulator/simulate_latency_budget.py \
+  --workload simulator/workload.json \
+  --baseline simulator/baseline.json \
+  --num-gpus 4 \
+  --gpu-mem 40 \
+  --interconnect nvlink \
+  --nvlink-bandwidth 150.0 \
+  --sweep "5:35,10:30,20:20" \
+  --out simulator/sim_calibrated.csv \
+  --plot simulator/sim_calibrated.png
+
+# PCIe Only (e.g. 4090 集群)
+python3 simulator/simulate_latency_budget.py \
+  --num-gpus 4 \
+  --gpu-mem 40 \
+  --interconnect pcie \
+  --pcie-bandwidth 16.0 \
+  --interconnect-latency-ms 0.6 \
+  --workload simulator/workload.json \
+  --baseline simulator/baseline.json \
+  --sweep "5:35,10:30,20:20,25:15,30:10,35:5" \
+  --out simulator/sim_pcie.csv \
+  --plot simulator/sim_pcie.png
 
 # 5. 完成并清理
 # Conda 环境在脚本结束时会自动去激活

@@ -43,8 +43,8 @@ FEATURE_GROUPS: Dict[str, Dict[str, object]] = {
             "viewer_id",
             "dummy_contexual",
         ],
-        "avg_len": 15000,
-        "variance": 1000,
+        "avg_len": 1400,
+        "variance": 100,
     },
     "items": {
         "names": [
@@ -56,8 +56,8 @@ FEATURE_GROUPS: Dict[str, Dict[str, object]] = {
             "item_target_watchtime",
             "item_query_time",
         ],
-        "avg_len": 5,
-        "variance": 2,
+        "avg_len": 128,
+        "variance": 10,
     },
 }
 
