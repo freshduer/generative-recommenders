@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu27
+#SBATCH -w gpu28
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=64
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs-embswap/%x_%j.out
-#SBATCH --error=logs-embswap/%x_%j.err
+#SBATCH --output=logs/%x_%j_cpu.out
+#SBATCH --error=logs/%x_%j_cpu.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>
@@ -87,7 +87,7 @@ fi
 echo "MASTER_PORT set to ${MASTER_PORT}"
 
 ## hstu
-# torchrun --nproc_per_node=1 main.py
+torchrun --nproc_per_node=1 main.py
 
 ## shard
 # torchrun --nproc_per_node=2 test_custom_sharding.py
@@ -146,17 +146,17 @@ echo "MASTER_PORT set to ${MASTER_PORT}"
 #   --seed 2025
 
 # embedding with cpu swap (自研 CPU+GPU cache 版本)
-torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_cpu_gpu_cached_embedding_collection.py \
-  --batch-size 8 \
-  --warmup-steps 40 \
-  --measure-steps 100 \
-  --num-embeddings 60000000 \
-  --embedding-dim 256 \
-  --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
-  --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
-  --resample-per-step \
+# torchrun --master-port "${MASTER_PORT}" --nproc_per_node=1 benchmark/benchmark_cpu_gpu_cached_embedding_collection.py \
+#   --batch-size 8 \
+#   --warmup-steps 40 \
+#   --measure-steps 100 \
+#   --num-embeddings 60000000 \
+#   --embedding-dim 256 \
+#   --limit 2GB \
+#   --resample-per-step \
   # --hot-ids-path /path/to/hot_ids.json  # 可选：外部 hot ids 预热
-
+#   --limit 2GB --limit 5GB --limit 8GB --limit 10GB --limit 12GB --limit 15GB \
+#   --limit 20GB --limit 25GB --limit 30GB --limit 35GB --limit 40GB \
 ## simulate
 # python3 simulator/simulate_latency_budget.py \
 #     --workload simulator/workload.json \

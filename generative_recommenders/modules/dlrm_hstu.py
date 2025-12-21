@@ -140,12 +140,12 @@ class DlrmHSTU(HammerModule):
         self.sparse_times = []
 
         if not is_dense:
-            # self._embedding_collection: EmbeddingCollection = EmbeddingCollection(
-            #     tables=list(embedding_tables.values()),
-            #     need_indices=False,
-            #     device=torch.device("meta"),
-            # )
-            self._embedding_collection = embedding_collection
+            self._embedding_collection: EmbeddingCollection = EmbeddingCollection(
+                tables=list(embedding_tables.values()),
+                need_indices=False,
+                device=torch.device("cpu"),
+            )
+            # self._embedding_collection = embedding_collection
 
         # multitask configs must be sorted by task types
         self._multitask_configs: List[TaskConfig] = hstu_configs.multitask_configs

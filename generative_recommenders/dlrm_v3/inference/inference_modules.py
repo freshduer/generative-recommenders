@@ -126,15 +126,23 @@ def move_sparse_output_to_device(
     torch.Tensor,
     torch.Tensor,
 ]:
-    num_candidates = num_candidates.to(device)
-    uih_seq_lengths = uih_seq_lengths.to(device)
+    # 批量传输标量张量
+    num_candidates = num_candidates.to(device, non_blocking=True)
+    uih_seq_lengths = uih_seq_lengths.to(device, non_blocking=True)
+    
+    # 优化：合并类型转换和设备传输，使用 non_blocking 进行异步传输
     seq_embeddings = {
         k: SequenceEmbedding(
-            lengths=seq_embeddings[k].lengths.to(device),
-            embedding=seq_embeddings[k].embedding.to(device).to(torch.bfloat16),
+            lengths=seq_embeddings[k].lengths.to(device, non_blocking=True),
+            embedding=seq_embeddings[k].embedding.to(device=device, dtype=torch.bfloat16, non_blocking=True),
         )
         for k in seq_embeddings.keys()
     }
-    for k, v in payload_features.items():
-        payload_features[k] = v.to(device)
+    
+    # 优化：批量传输 payload_features，使用 non_blocking
+    payload_features = {
+        k: v.to(device, non_blocking=True)
+        for k, v in payload_features.items()
+    }
+    
     return seq_embeddings, payload_features, uih_seq_lengths, num_candidates

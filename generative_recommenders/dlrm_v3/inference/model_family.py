@@ -197,11 +197,12 @@ class ModelFamilySparseDist:
     
     def _load_single_sparse(self,model_path):
         logger.info(f"[rank {self.rank}] Using CustomEmbeddingCollection manual sharding")
-        custom_ec = CustomEmbeddingCollection(
-            table_config={cfg.name: cfg for cfg in self.table_config.values()},
-            constraints=self.constraints,
-            device=self.device  # 根据是否 offload 传入 CPU 或 GPU
-        )
+        # custom_ec = CustomEmbeddingCollection(
+        #     table_config={cfg.name: cfg for cfg in self.table_config.values()},
+        #     constraints=self.constraints,
+        #     device=self.device  # 根据是否 offload 传入 CPU 或 GPU
+        # )
+        custom_ec = None
         if self.quant:
             self.sparse_arch = HSTUSparseInferenceModule(
                 table_config=self.table_config,

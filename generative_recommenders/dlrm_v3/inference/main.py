@@ -351,8 +351,8 @@ def run(
         table_config,
         # sharding_type=ShardingType.DATA_PARALLEL,
         # sharding_type=ShardingType.TABLE_WISE,
-        sharding_type=ShardingType.REPLICATED,
-        # sharding_type=ShardingType.CPU_OFFLOAD,
+        # sharding_type=ShardingType.REPLICATED,
+        sharding_type=ShardingType.CPU_OFFLOAD,
     )
     # 打印 constraints 概览与详细内容
     try:

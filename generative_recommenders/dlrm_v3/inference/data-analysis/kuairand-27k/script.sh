@@ -1,6 +1,6 @@
 # 1) 统计 KuaiRand-1K 数据概况并导出 CSV/JSON
 python analyze_kuairand.py \
-  --data-dir /home/comp/cswjyu/data/KuaiRand-1K/data \
+  --data-dir /home/comp/cswjyu/data/KuaiRand-27K/data \
   --summary-json reports/kuairand_summary.json \
   --user-stats-csv reports/user_interactions.csv \
   --item-stats-csv reports/item_popularity.csv \
@@ -31,17 +31,17 @@ python plot_dedup_from_exports.py \
 # 对于27K用户，使用以下优化参数：
 # - 跳过轮廓系数计算以加速（或使用采样）
 # - 使用K-means聚类（比层次聚类快）
-python analyze_user_clustering.py \
-  --data-dir /home/comp/cswjyu/data/KuaiRand-1K/data \
-  --output-dir reports \
-  --sample-users 1000 \
-  --min-interactions 5 \
-  --n-clusters 20 \
-  --clustering-method kmeans \
-  --similarity-metric jaccard \
-  --max-heatmap-users 500 \
-  --skip-silhouette \
-  --show-progress 2>&1 | tee logs/kuairan-1k-clustering.log
+# python analyze_user_clustering.py \
+#   --data-dir /home/comp/cswjyu/data/KuaiRand-27K/data \
+#   --output-dir reports \
+#   --sample-users 27000 \
+#   --min-interactions 5 \
+#   --n-clusters 5 \
+#   --clustering-method kmeans \
+#   --similarity-metric jaccard \
+#   --max-heatmap-users 500 \
+#   --skip-silhouette \
+#   --show-progress
 
 # # 如果需要轮廓系数，可以使用采样方法（更慢但更准确）：
 # python analyze_user_clustering.py \
