@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu28
+#SBATCH -w gpu27
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=64
@@ -29,8 +29,8 @@
 #SBATCH --time=01:00:00
 
 # 标准输出和错误输出文件路径
-#SBATCH --output=logs/%x_%j_cpu.out
-#SBATCH --error=logs/%x_%j_cpu.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 # --------------------------------------------------------------------------------
 # >>> conda initialize >>>

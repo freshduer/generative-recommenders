@@ -26,8 +26,9 @@ HSTU_EMBEDDING_DIM = 256
 HASH_SIZE = 10_000_000
 
 
-def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
+def get_hstu_configs(dataset: str = "debug", max_seq_len: int = 16384) -> DlrmHSTUConfig:
     hstu_config = DlrmHSTUConfig(
+        max_seq_len=max_seq_len,
         hstu_num_heads=4,
         hstu_attn_linear_dim=64,
         hstu_attn_qk_dim=64,

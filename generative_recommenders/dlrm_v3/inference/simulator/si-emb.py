@@ -7,7 +7,7 @@ lat_gpu_hit = 0.9    # 100% hit
 lat_cpu_miss = 31.0  # 100% miss (10ms lookup + 21ms transfer)
 
 # 数据分布参数
-total_emb_size_gb = 500.0   # 2TB (20亿行 * 1KB)
+total_emb_size_gb = 200.0   # 2TB (20亿行 * 1KB)
 hotspot_ratio = 0.1          # 10% items
 hotspot_access_ratio = 0.9   # 90% requests
 

@@ -334,6 +334,7 @@ def run(
     dev_mode: bool = False,
     dataset_percentage: float = 1.0,
     torch_random_seed: int = 42,
+    max_seq_len: int = 16384,
 ) -> None:
     log_gpu_memory(prefix="Before run:")
     set_dev_mode(dev_mode)
@@ -344,15 +345,15 @@ def run(
     log_gpu_memory(prefix="Before dist init:")
     dist.init_process_group(backend="nccl")
 
-    hstu_config = get_hstu_configs(dataset)
+    hstu_config = get_hstu_configs(dataset, max_seq_len=max_seq_len)
     table_config = get_embedding_table_config(dataset)
     set_is_inference(is_inference=not compute_eval)
     constraints=gen_constraints_from_table_config(
         table_config,
         # sharding_type=ShardingType.DATA_PARALLEL,
         # sharding_type=ShardingType.TABLE_WISE,
-        # sharding_type=ShardingType.REPLICATED,
-        sharding_type=ShardingType.CPU_OFFLOAD,
+        sharding_type=ShardingType.REPLICATED,
+        # sharding_type=ShardingType.CPU_OFFLOAD,
     )
     # 打印 constraints 概览与详细内容
     try:

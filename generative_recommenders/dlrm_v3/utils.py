@@ -267,10 +267,10 @@ SUPPORTED_DATASETS = [
 ]
 
 
-def get_dataset(name: str, new_path_prefix: str = ""):
+def get_dataset(name: str, new_path_prefix: str = "", debug_dataset_size: int = 10000):
     assert name in SUPPORTED_DATASETS, f"dataset {name} not supported"
     if name == "debug":
-        return DLRMv3RandomDataset, {}
+        return DLRMv3RandomDataset, {"num_aggregated_samples": debug_dataset_size}
     if name == "movielens-1m":
         return (
             DLRMv3MovieLensDataset,

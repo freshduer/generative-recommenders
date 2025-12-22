@@ -7,7 +7,7 @@ batch_size = 8
 num_users = 200  # 用户池
 
 # 模型参数（用于计算 KV cache 大小）
-user_length = 10000  # 用户序列长度（历史交互数量）
+user_length = 5000  # 用户序列长度（历史交互数量）
 num_layers = 3       # Transformer 层数
 num_heads = 4        # Attention head 数量
 attention_dim = 64   # K 的维度（每个 head 的 attention 维度，通常是 qk_dim）
@@ -41,8 +41,22 @@ pcie_bandwidth_gbps = 32.0    # CPU→GPU 传输带宽 (GB/s)，PCIe Gen4 典型
 # 自动计算每个用户的传输延迟：延迟(ms) = 数据大小(MB) / 带宽(GB/s) * 1000 / 1024
 latency_transfer_per_user = (kv_size_per_user_gb / pcie_bandwidth_gbps) * 1000.0
 
-latency_base_compute = 12.0      # GPU 计算时间（数据已在 GPU）
-latency_recompute_batch = 42.0    # 整个 batch 的 recompute 时间（当所有 KV cache 都不在显存时，整个 batch 一起 recompute 需要 42ms）
+if user_length == 15000:
+    if num_layers == 3:
+        latency_recompute_batch = 42.0
+    elif num_layers == 6:
+        latency_recompute_batch = 63.0
+    else:
+        raise ValueError(f"Unsupported number of layers: {num_layers}")
+elif user_length == 5000:
+    if num_layers == 3:
+        latency_recompute_batch = 15.0
+    elif num_layers == 6:
+        latency_recompute_batch = 27.5
+    else:
+        raise ValueError(f"Unsupported number of layers: {num_layers}")
+
+latency_base_compute = latency_recompute_batch/3.5      # GPU 计算时间（数据已在 GPU）
 
 # 流量分布参数
 hotspot_user_ratio = 0.1    # 20% 的用户是热门用户
