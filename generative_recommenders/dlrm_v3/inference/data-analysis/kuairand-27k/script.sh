@@ -43,15 +43,22 @@ python plot_dedup_from_exports.py \
 #   --skip-silhouette \
 #   --show-progress
 
-# # 如果需要轮廓系数，可以使用采样方法（更慢但更准确）：
-# python analyze_user_clustering.py \
-#   --data-dir /home/comp/cswjyu/data/KuaiRand-1K/data \
-#   --output-dir reports \
-#   --sample-users 1000 \
-#   --min-interactions 5 \
-#   --n-clusters 100 \
-#   --clustering-method kmeans \
-#   --similarity-metric jaccard \
-#   --max-heatmap-users 500 \
-#   --skip-silhouette \
-#   --show-progress
+#分析不同时间窗口下数据长度
+# 按天分析（默认）
+python analyze_sequence_length_by_time_window.py \
+  --data-dir /home/comp/cswjyu/data/KuaiRand-27K/data \
+  --window-type day \
+  --output-dir reports \
+  --show-progress
+
+# 按周分析
+python analyze_sequence_length_by_time_window.py \
+  --data-dir /home/comp/cswjyu/data/KuaiRand-27K/data \
+  --window-type week \
+  --show-progress
+
+# 按小时分析
+python analyze_sequence_length_by_time_window.py \
+  --data-dir /home/comp/cswjyu/data/KuaiRand-27K/data \
+  --window-type hour \
+  --show-progress

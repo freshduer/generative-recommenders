@@ -64,3 +64,67 @@ python3 analyze_ml_user_clustering.py \
   --max-heatmap-users 500 \
   --skip-silhouette \
   --show-progress  2>&1 | tee logs/ml20m-clustering-small2.log
+
+
+# 分析不同时间窗口下用户交互序列长度分布和活跃用户数
+# ML-1M 数据集
+
+# 30分钟窗口
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-1m \
+  --window-type 30min \
+  --show-progress \
+  2>&1 | tee logs/ml1m-time-window-30min.log
+
+# 1小时窗口
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-1m \
+  --window-type 1h \
+  --show-progress \
+  2>&1 | tee logs/ml1m-time-window-1h.log
+
+# 12小时窗口（半天）
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-1m \
+  --window-type 12h \
+  --show-progress \
+  2>&1 | tee logs/ml1m-time-window-12h.log
+
+# 1天窗口
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-1m \
+  --window-type 1d \
+  --show-progress \
+  2>&1 | tee logs/ml1m-time-window-1d.log
+
+# ============================================================================
+# ML-20M 数据集分析（适用于更大的数据集）
+# ============================================================================
+
+# 30分钟窗口
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-20m \
+  --window-type 30min \
+  --show-progress \
+  2>&1 | tee logs/ml20m-time-window-30min.log
+
+# 1小时窗口
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-20m \
+  --window-type 1h \
+  --show-progress \
+  2>&1 | tee logs/ml20m-time-window-1h.log
+
+# 12小时窗口（半天）
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-20m \
+  --window-type 12h \
+  --show-progress \
+  2>&1 | tee logs/ml20m-time-window-12h.log
+
+# 1天窗口（推荐，因为ml-20m数据量大，使用1天窗口可以减少计算量）
+python3 analyze_ml1m_time_window.py \
+  --data-dir /home/comp/cswjyu/data/ml-20m \
+  --window-type 1d \
+  --show-progress \
+  2>&1 | tee logs/ml20m-time-window-1d.log
