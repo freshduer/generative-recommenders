@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from collections import OrderedDict
 import sys
 import os
+import math
 
 # ---- 核心场景参数 ----
 batch_size = 8
@@ -40,24 +41,55 @@ kv_size_per_user_gb = kv_size_per_user_mb / 1024.0
 #
 # 传输带宽参数
 pcie_bandwidth_gbps = 32.0    # CPU→GPU 传输带宽 (GB/s)，PCIe Gen4 典型值
+
+# 根据真实数据点拟合幂函数来计算 latency_recompute_batch
+# 真实数据点：
+#   user_length=5000, num_layers=3: latency_recompute_batch=15.0
+#   user_length=15000, num_layers=3: latency_recompute_batch=42.0
+# 使用幂函数拟合：latency = a * user_length^b
+# 对于 num_layers=3: b = ln(42.0/15.0) / ln(15000/5000) = ln(2.8) / ln(3) ≈ 0.94
+#                    a = 15.0 / 5000^0.94 ≈ 0.0043
+def get_latency_recompute_batch(user_length, num_layers):
+    """根据 user_length 和 num_layers 计算 latency_recompute_batch"""
+    # 真实数据点
+    if user_length == 5000:
+        if num_layers == 3:
+            return 15.0
+        elif num_layers == 6:
+            return 27.5
+        else:
+            raise ValueError(f"Unsupported number of layers: {num_layers}")
+    elif user_length == 15000:
+        if num_layers == 3:
+            return 42.0
+        elif num_layers == 6:
+            return 63.0
+        else:
+            raise ValueError(f"Unsupported number of layers: {num_layers}")
+    else:
+        # 使用幂函数拟合其他点
+        # 基于 num_layers=3 的真实数据点拟合
+        if num_layers == 3:
+            # 幂函数参数：latency = a * user_length^b
+            # 从 (5000, 15.0) 和 (15000, 42.0) 拟合
+            b = math.log(42.0 / 15.0) / math.log(15000.0 / 5000.0)  # ≈ 0.94
+            a = 15.0 / (5000.0 ** b)  # ≈ 0.0043
+            latency = a * (user_length ** b)
+            return latency
+        elif num_layers == 6:
+            # 对于 num_layers=6，使用相同的比例关系
+            # 从 (5000, 27.5) 和 (15000, 63.0) 拟合
+            b = math.log(63.0 / 27.5) / math.log(15000.0 / 5000.0)  # ≈ 0.92
+            a = 27.5 / (5000.0 ** b)
+            latency = a * (user_length ** b)
+            return latency
+        else:
+            raise ValueError(f"Unsupported number of layers: {num_layers}")
+
 # 自动计算每个用户的传输延迟：延迟(ms) = 数据大小(MB) / 带宽(GB/s) * 1000 / 1024
 latency_transfer_per_user = (kv_size_per_user_gb / pcie_bandwidth_gbps) * 1000.0
 
-if user_length == 15000:
-    if num_layers == 3:
-        latency_recompute_batch = 42.0
-    elif num_layers == 6:
-        latency_recompute_batch = 63.0
-    else:
-        raise ValueError(f"Unsupported number of layers: {num_layers}")
-elif user_length == 5000:
-    if num_layers == 3:
-        latency_recompute_batch = 15.0
-    elif num_layers == 6:
-        latency_recompute_batch = 27.5
-    else:
-        raise ValueError(f"Unsupported number of layers: {num_layers}")
-
+latency_recompute_batch = get_latency_recompute_batch(user_length, num_layers)
 latency_base_compute = latency_recompute_batch/3.5      # GPU 计算时间（数据已在 GPU）
 
 # 流量分布参数
@@ -98,14 +130,26 @@ def generate_traffic_with_hotspots(num_users, batch_size, num_batches, hotspot_u
     return np.array(traffic).reshape(num_batches, batch_size)
 
 # ---- 模拟函数 ----
-def run_simulation(num_users, output_file=None, append_mode=False):
+def run_simulation(num_users, user_length, output_file=None, append_mode=False):
     """
     运行 KV cache 模拟
     Args:
         num_users: 用户数量
+        user_length: 用户序列长度
         output_file: 输出文件路径，如果为None则输出到stdout
         append_mode: 是否以追加模式打开文件
     """
+    # 根据 user_length 重新计算相关参数
+    k_size_per_user_bytes = user_length * num_layers * num_heads * attention_dim * kv_dtype_bytes
+    v_size_per_user_bytes = user_length * num_layers * num_heads * hidden_dim * kv_dtype_bytes
+    kv_size_per_user_bytes = k_size_per_user_bytes + v_size_per_user_bytes
+    kv_size_per_user_mb = kv_size_per_user_bytes / (1024.0 * 1024.0)
+    kv_size_per_user_gb = kv_size_per_user_mb / 1024.0
+    
+    # 计算延迟参数
+    latency_recompute_batch = get_latency_recompute_batch(user_length, num_layers)
+    latency_base_compute = latency_recompute_batch / 3.5
+    latency_transfer_per_user = (kv_size_per_user_gb / pcie_bandwidth_gbps) * 1000.0
     # 保存原始的stdout
     original_stdout = sys.stdout
     
@@ -301,25 +345,29 @@ def run_simulation(num_users, output_file=None, append_mode=False):
             print(f"Results saved to {output_file}")
 
 
-# ---- 主循环：测试不同的 num_users ----
+# ---- 主循环：测试不同的 user_length ----
 if __name__ == "__main__":
     # 创建输出目录（相对于脚本位置）
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, "results")
     os.makedirs(output_dir, exist_ok=True)
     
-    # num_users 从 100 开始，间隔 200，到 5000
-    num_users_list = list(range(100, 5001, 200))
+    # user_length 从 3000 开始，间隔 1000，到 15000
+    user_length_list = list(range(3000, 15001, 1000))
+    
+    # 固定 num_users 值（可以根据需要修改）
+    num_users = 3000
     
     # 所有结果保存到一个文件
-    output_file = os.path.join(output_dir, "kv_cache_sim_all_num_users.txt")
+    output_file = os.path.join(output_dir, "kv_cache_sim_all_user_length.txt")
     
-    print(f"Running simulations for {len(num_users_list)} different num_users values...")
-    print(f"num_users range: {num_users_list[0]} to {num_users_list[-1]}, step=200")
+    print(f"Running simulations for {len(user_length_list)} different user_length values...")
+    print(f"user_length range: {user_length_list[0]} to {user_length_list[-1]}, step=1000")
+    print(f"Fixed num_users: {num_users}")
     print(f"All results will be saved to: {output_file}\n")
     
-    for i, num_users in enumerate(num_users_list):
-        print(f"Running simulation for num_users={num_users}...")
+    for i, user_length_val in enumerate(user_length_list):
+        print(f"Running simulation for user_length={user_length_val}...")
         
         # 如果是第一次，使用写入模式；否则使用追加模式，并添加分隔符
         if i > 0:
@@ -330,8 +378,8 @@ if __name__ == "__main__":
                 f.write("\n")
         
         # 运行模拟，将输出写入文件
-        run_simulation(num_users, output_file, append_mode=(i > 0))
+        run_simulation(num_users, user_length_val, output_file, append_mode=(i > 0))
         
-        print(f"Completed num_users={num_users}\n")
+        print(f"Completed user_length={user_length_val}\n")
     
     print(f"All simulations completed! Results saved to {output_file}")
