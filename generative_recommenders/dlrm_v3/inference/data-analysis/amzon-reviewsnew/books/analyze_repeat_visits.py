@@ -481,33 +481,88 @@ def analyze_access_concentration(df: pd.DataFrame, user_stats: pd.DataFrame, sho
     total_users = len(user_stats_sorted)
     total_visits = user_stats_sorted['total_visits'].sum()
     
+    # 统计用户访问次数分布
+    if show_progress:
+        logger.info("Computing user visit count distribution...")
+    
+    visit_count_dist = user_stats_sorted['total_visits'].value_counts().sort_index()
+    visit_count_stats = {}
+    for visit_count, num_users in visit_count_dist.items():
+        visit_count_stats[int(visit_count)] = {
+            'num_users': int(num_users),
+            'percentage': float(num_users / total_users * 100)
+        }
+    
+    logger.info(f"\n用户访问次数分布统计:")
+    logger.info(f"  总用户数: {total_users:,}")
+    logger.info(f"  总访问次数: {total_visits:,}")
+    logger.info(f"\n访问次数分布 (前20个最常见的访问次数):")
+    for visit_count in sorted(visit_count_stats.keys())[:20]:
+        stats = visit_count_stats[visit_count]
+        logger.info(f"  {visit_count} 次访问: {stats['num_users']:,} 用户 ({stats['percentage']:.2f}%)")
+    
+    # 统计访问次数范围分布
+    logger.info(f"\n访问次数范围分布:")
+    ranges = [
+        (1, 1, "1次"),
+        (2, 5, "2-5次"),
+        (6, 10, "6-10次"),
+        (11, 20, "11-20次"),
+        (21, 50, "21-50次"),
+        (51, 100, "51-100次"),
+        (101, 200, "101-200次"),
+        (201, 500, "201-500次"),
+        (501, 1000, "501-1000次"),
+        (1001, float('inf'), "1001次以上")
+    ]
+    for min_visits, max_visits, label in ranges:
+        if max_visits == float('inf'):
+            count = ((user_stats_sorted['total_visits'] >= min_visits).sum())
+        else:
+            count = ((user_stats_sorted['total_visits'] >= min_visits) & 
+                    (user_stats_sorted['total_visits'] <= max_visits)).sum()
+        pct = (count / total_users * 100) if total_users > 0 else 0
+        logger.info(f"  {label}: {count:,} 用户 ({pct:.2f}%)")
+    
     # Compute cumulative statistics
     user_stats_sorted['cumulative_visits'] = user_stats_sorted['total_visits'].cumsum()
     user_stats_sorted['cumulative_pct'] = (user_stats_sorted['cumulative_visits'] / total_visits * 100)
     user_stats_sorted['user_rank_pct'] = ((user_stats_sorted.index + 1) / total_users * 100)
     
-    # Find top 10%, 5%, 1% users
-    top_10_pct_idx = int(total_users * 0.1)
-    top_5_pct_idx = int(total_users * 0.05)
-    top_1_pct_idx = int(total_users * 0.01)
+    # Find top 0.1%, 1%, 5%, 10%, 20% users
+    top_0_1_pct_idx = max(1, int(total_users * 0.001))  # At least 1 user
+    top_1_pct_idx = max(1, int(total_users * 0.01))
+    top_5_pct_idx = max(1, int(total_users * 0.05))
+    top_10_pct_idx = max(1, int(total_users * 0.1))
+    top_20_pct_idx = max(1, int(total_users * 0.2))
     
-    top_10_pct_visits = user_stats_sorted.iloc[:top_10_pct_idx]['total_visits'].sum()
-    top_5_pct_visits = user_stats_sorted.iloc[:top_5_pct_idx]['total_visits'].sum()
+    top_0_1_pct_visits = user_stats_sorted.iloc[:top_0_1_pct_idx]['total_visits'].sum()
     top_1_pct_visits = user_stats_sorted.iloc[:top_1_pct_idx]['total_visits'].sum()
+    top_5_pct_visits = user_stats_sorted.iloc[:top_5_pct_idx]['total_visits'].sum()
+    top_10_pct_visits = user_stats_sorted.iloc[:top_10_pct_idx]['total_visits'].sum()
+    top_20_pct_visits = user_stats_sorted.iloc[:top_20_pct_idx]['total_visits'].sum()
     
-    top_10_pct_ratio = (top_10_pct_visits / total_visits * 100) if total_visits > 0 else 0
-    top_5_pct_ratio = (top_5_pct_visits / total_visits * 100) if total_visits > 0 else 0
+    top_0_1_pct_ratio = (top_0_1_pct_visits / total_visits * 100) if total_visits > 0 else 0
     top_1_pct_ratio = (top_1_pct_visits / total_visits * 100) if total_visits > 0 else 0
+    top_5_pct_ratio = (top_5_pct_visits / total_visits * 100) if total_visits > 0 else 0
+    top_10_pct_ratio = (top_10_pct_visits / total_visits * 100) if total_visits > 0 else 0
+    top_20_pct_ratio = (top_20_pct_visits / total_visits * 100) if total_visits > 0 else 0
     
-    # Print statistics
+    # Print statistics - 重点显示访问次数
     logger.info(f"Total users: {total_users:,}")
     logger.info(f"Total visits: {total_visits:,}")
     logger.info(f"")
-    logger.info(f"Top 1% users ({top_1_pct_idx:,} users): {top_1_pct_visits:,} visits ({top_1_pct_ratio:.2f}%)")
-    logger.info(f"Top 5% users ({top_5_pct_idx:,} users): {top_5_pct_visits:,} visits ({top_5_pct_ratio:.2f}%)")
-    logger.info(f"Top 10% users ({top_10_pct_idx:,} users): {top_10_pct_visits:,} visits ({top_10_pct_ratio:.2f}%)")
+    logger.info(f"="*60)
+    logger.info(f"热门用户访问次数统计 (访问次数)")
+    logger.info(f"="*60)
+    logger.info(f"Top 0.1% 热门用户 ({top_0_1_pct_idx:,} 用户): {top_0_1_pct_visits:,} 次访问 ({top_0_1_pct_ratio:.2f}%)")
+    logger.info(f"Top 1% 热门用户 ({top_1_pct_idx:,} 用户): {top_1_pct_visits:,} 次访问 ({top_1_pct_ratio:.2f}%)")
+    logger.info(f"Top 5% 热门用户 ({top_5_pct_idx:,} 用户): {top_5_pct_visits:,} 次访问 ({top_5_pct_ratio:.2f}%)")
+    logger.info(f"Top 10% 热门用户 ({top_10_pct_idx:,} 用户): {top_10_pct_visits:,} 次访问 ({top_10_pct_ratio:.2f}%)")
+    logger.info(f"Top 20% 热门用户 ({top_20_pct_idx:,} 用户): {top_20_pct_visits:,} 次访问 ({top_20_pct_ratio:.2f}%)")
+    logger.info(f"="*60)
     logger.info(f"")
-    logger.info(f"Bottom 90% users ({total_users - top_10_pct_idx:,} users): {total_visits - top_10_pct_visits:,} visits ({100-top_10_pct_ratio:.2f}%)")
+    logger.info(f"Bottom 80% users ({total_users - top_20_pct_idx:,} users): {total_visits - top_20_pct_visits:,} visits ({100-top_20_pct_ratio:.2f}%)")
     
     # Compute Gini coefficient (measure of inequality)
     # Sort visits in ascending order for Gini calculation
@@ -525,6 +580,10 @@ def analyze_access_concentration(df: pd.DataFrame, user_stats: pd.DataFrame, sho
     return {
         'total_users': int(total_users),
         'total_visits': int(total_visits),
+        'user_visit_count_distribution': visit_count_stats,
+        'top_0_1_pct_users': int(top_0_1_pct_idx),
+        'top_0_1_pct_visits': int(top_0_1_pct_visits),
+        'top_0_1_pct_ratio': float(top_0_1_pct_ratio),
         'top_1_pct_users': int(top_1_pct_idx),
         'top_1_pct_visits': int(top_1_pct_visits),
         'top_1_pct_ratio': float(top_1_pct_ratio),
@@ -534,6 +593,9 @@ def analyze_access_concentration(df: pd.DataFrame, user_stats: pd.DataFrame, sho
         'top_10_pct_users': int(top_10_pct_idx),
         'top_10_pct_visits': int(top_10_pct_visits),
         'top_10_pct_ratio': float(top_10_pct_ratio),
+        'top_20_pct_users': int(top_20_pct_idx),
+        'top_20_pct_visits': int(top_20_pct_visits),
+        'top_20_pct_ratio': float(top_20_pct_ratio),
         'gini_coefficient': float(gini),
         'cumulative_stats': user_stats_sorted[['user_id', 'total_visits', 'user_rank_pct', 'cumulative_pct']].to_dict('records')
     }
@@ -726,9 +788,11 @@ def plot_access_concentration(
     summary_text = "Access Concentration Statistics:\n\n"
     summary_text += f"Total Users: {concentration_stats['total_users']:,}\n"
     summary_text += f"Total Visits: {concentration_stats['total_visits']:,}\n\n"
-    summary_text += f"Top 1% Users: {concentration_stats['top_1_pct_ratio']:.2f}%\n"
-    summary_text += f"Top 5% Users: {concentration_stats['top_5_pct_ratio']:.2f}%\n"
-    summary_text += f"Top 10% Users: {concentration_stats['top_10_pct_ratio']:.2f}%\n\n"
+    summary_text += f"Top 0.1% Users: {concentration_stats.get('top_0_1_pct_visits', 0):,} visits ({concentration_stats.get('top_0_1_pct_ratio', 0):.2f}%)\n"
+    summary_text += f"Top 1% Users: {concentration_stats.get('top_1_pct_visits', 0):,} visits ({concentration_stats.get('top_1_pct_ratio', 0):.2f}%)\n"
+    summary_text += f"Top 5% Users: {concentration_stats.get('top_5_pct_visits', 0):,} visits ({concentration_stats.get('top_5_pct_ratio', 0):.2f}%)\n"
+    summary_text += f"Top 10% Users: {concentration_stats.get('top_10_pct_visits', 0):,} visits ({concentration_stats.get('top_10_pct_ratio', 0):.2f}%)\n"
+    summary_text += f"Top 20% Users: {concentration_stats.get('top_20_pct_visits', 0):,} visits ({concentration_stats.get('top_20_pct_ratio', 0):.2f}%)\n\n"
     summary_text += f"Gini Coefficient: {concentration_stats['gini_coefficient']:.4f}\n"
     ax4.text(0.1, 0.5, summary_text, fontsize=11, verticalalignment='center', 
              family='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
