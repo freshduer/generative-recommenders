@@ -4,7 +4,7 @@ from collections import OrderedDict
 
 # ---- 核心场景参数 ----
 batch_size = 8
-num_users = 200  # 用户池
+num_users = 300  # 用户池
 
 # 模型参数（用于计算 KV cache 大小）
 user_length = 5000  # 用户序列长度（历史交互数量）
@@ -131,7 +131,7 @@ for gpu_mem in gpu_memory_sizes:
     capacity_users = int(gpu_mem / kv_size_per_user_gb)
     
     # 模拟 LRU Cache
-    gpu_cache = OrderedDict()
+    gpu_cache: OrderedDict[int, bool] = OrderedDict()
     
     total_latency = 0.0
     total_hits = 0
@@ -161,23 +161,30 @@ for gpu_mem in gpu_memory_sizes:
         
         # 计算当前 batch 的延迟
         # 对于整个 batch，比较两种策略：
-        # 1. Transfer 策略：每个 miss 的用户都传输，总时间 = base_compute + miss_count * transfer_time_per_user
-        # 2. Recompute 策略：整个 batch 一起 recompute，总时间 = latency_recompute_batch（不需要 base_compute，因为不需要 KV cache）
+        # 1. Transfer 策略：传输所有 miss 的用户，然后计算整个 batch（hit 的用户用 cache，miss 的用户用传输的数据）
+        #    总时间 = base_compute + miss_count * transfer_time_per_user
+        # 2. Recompute 策略：recompute 整个 batch（当 miss 多时，这比传输更划算）
+        #    总时间 = latency_recompute_batch（不需要传输，直接 recompute）
         # 选择较小的那个
         if batch_miss_count == 0:
             # 全部 hit，使用基础计算时间（KV cache 在 GPU）
             batch_latency = latency_base_compute
         else:
+            # Transfer 策略：传输所有 miss 的用户
             transfer_time_total = batch_miss_count * latency_transfer_per_user
             transfer_strategy_latency = latency_base_compute + transfer_time_total
+            
+            # Recompute 策略：recompute 整个 batch
+            # 注意：当 miss 多时，recompute 整个 batch 可能比传输所有 miss 用户更划算
+            # 因为传输时间 = miss_count * transfer_time_per_user，当 miss_count 大时，传输成本很高
             recompute_strategy_latency = latency_recompute_batch
             
             if transfer_strategy_latency < recompute_strategy_latency:
-                # 选择传输策略
+                # 选择传输策略：传输 miss 的用户，hit 的用户用 cache
                 batch_latency = transfer_strategy_latency
                 total_transfers += batch_miss_count
             else:
-                # 选择 recompute 策略（整个 batch 一起 recompute，不需要 KV cache，所以不需要 base_compute）
+                # 选择 recompute 策略：recompute 整个 batch（当 miss 多时，这比传输更划算）
                 batch_latency = recompute_strategy_latency
                 total_recomputes += 1  # 整个 batch 算一次 recompute
         

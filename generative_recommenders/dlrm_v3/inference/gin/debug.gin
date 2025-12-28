@@ -17,4 +17,4 @@ run.samples_per_query_multistream = 12
 run.max_num_samples = 2048
 run.numpy_rand_seed = 123
 run.dev_mode = True
-run.max_seq_len = 5000
+run.max_seq_len = 3000
