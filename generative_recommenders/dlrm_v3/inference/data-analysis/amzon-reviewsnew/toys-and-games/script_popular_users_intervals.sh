@@ -2,11 +2,11 @@
 # 分析热门用户的重复访问间隔时间
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_PATH="/home/comp/cswjyu/data/amazon-reviews/Books.jsonl"
+DATA_PATH="/home/comp/cswjyu/data/amazon-reviews/Toys_and_Games.jsonl"
 OUTPUT_DIR="${SCRIPT_DIR}/reports"
 
 echo "=========================================="
-echo "Amazon Reviews Books - 热门用户访问间隔分析"
+echo "Amazon Reviews Toys_and_Games - 热门用户访问间隔分析"
 echo "=========================================="
 echo "数据路径: ${DATA_PATH}"
 echo "输出目录: ${OUTPUT_DIR}"
