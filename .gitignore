@@ -156,3 +156,11 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+*.txt
+*.jsonl
+*.png
+*.csv
+*.json
+*.out
+*.err

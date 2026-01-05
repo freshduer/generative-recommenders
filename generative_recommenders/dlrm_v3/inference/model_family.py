@@ -125,7 +125,7 @@ class HSTUModelFamily:
         self, samples: Optional[Samples]
     ) -> Optional[
         Tuple[
-            torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float, float
+            torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float, float, float, float, int, int, float, float
         ]
     ]:
         """
@@ -143,6 +143,14 @@ class HSTUModelFamily:
             if samples is None:
                 self.dense.predict(None, None, 0, None, 0, None)
                 return None
+            # Debug: log input samples info
+            logger.debug(f"[ModelFamily.predict] Starting prediction")
+            logger.debug(f"[ModelFamily.predict] uih_features_kjt keys: {samples.uih_features_kjt.keys()}")
+            logger.debug(f"[ModelFamily.predict] uih_features_kjt lengths: {samples.uih_features_kjt.lengths()}")
+            logger.debug(f"[ModelFamily.predict] candidates_features_kjt keys: {samples.candidates_features_kjt.keys()}")
+            logger.debug(f"[ModelFamily.predict] candidates_features_kjt lengths: {samples.candidates_features_kjt.lengths()}")
+            
+            logger.debug(f"[ModelFamily.predict] Running sparse.predict...")
             (
                 seq_embeddings,
                 payload_features,
@@ -152,6 +160,17 @@ class HSTUModelFamily:
                 num_candidates,
                 dt_sparse,
             ) = self.sparse.predict(samples)
+            
+            # Debug: log sparse output info
+            logger.debug(f"[ModelFamily.predict] Sparse done. max_uih_len={max_uih_len}, max_num_candidates={max_num_candidates}")
+            logger.debug(f"[ModelFamily.predict] uih_seq_lengths shape: {uih_seq_lengths.shape}, values: {uih_seq_lengths}")
+            logger.debug(f"[ModelFamily.predict] num_candidates shape: {num_candidates.shape}, values: {num_candidates}")
+            for k, v in seq_embeddings.items():
+                logger.debug(f"[ModelFamily.predict] seq_embeddings[{k}]: embedding shape={v.embedding.shape}, lengths shape={v.lengths.shape}")
+            for k, v in payload_features.items():
+                logger.debug(f"[ModelFamily.predict] payload_features[{k}]: shape={v.shape}, dtype={v.dtype}")
+            
+            logger.debug(f"[ModelFamily.predict] Running dense.predict...")
             out = self.dense.predict(
                 seq_embeddings,
                 payload_features,
@@ -160,18 +179,59 @@ class HSTUModelFamily:
                 max_num_candidates,
                 num_candidates,
             )
-            (  # pyre-ignore [23]
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-                dt_dense,
-            ) = out
+            if len(out) == 10:
+                (  # pyre-ignore [23]
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_dense,
+                    dt_h2d,
+                    dt_d2h,
+                    h2d_size,
+                    d2h_size,
+                    dt_compute,
+                    dt_bubble,
+                ) = out
+            elif len(out) == 6:
+                # Backward compatibility
+                (  # pyre-ignore [23]
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_dense,
+                    dt_h2d,
+                    dt_d2h,
+                ) = out
+                h2d_size = 0
+                d2h_size = 0
+                dt_compute = 0.0
+                dt_bubble = 0.0
+            else:
+                # Backward compatibility
+                (  # pyre-ignore [23]
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_dense,
+                ) = out
+                dt_h2d = 0.0
+                dt_d2h = 0.0
+                h2d_size = 0
+                d2h_size = 0
+                dt_compute = 0.0
+                dt_bubble = 0.0
             return (
                 mt_target_preds,
                 mt_target_labels,
                 mt_target_weights,
                 dt_sparse,
                 dt_dense,
+                dt_h2d,
+                dt_d2h,
+                h2d_size,
+                d2h_size,
+                dt_compute,
+                dt_bubble,
             )
 
 
@@ -420,19 +480,65 @@ class ModelFamilyDenseDist:
         model = model.to(device)
         model.eval()
         profiler = Profiler(rank) if self.output_trace else None
+        
+        # Create separate CUDA streams for compute and transfer to enable pipeline overlap
+        # compute_stream: for model forward pass (default stream)
+        # transfer_stream: for H2D/D2H transfers to overlap with compute
+        transfer_stream = torch.cuda.Stream(device=device)
+        next_item = None
+        next_item_ready = False
 
         with torch.no_grad():
             while True:
-                item = self.samples_q[rank].get()
+                # Pipeline: while computing current batch, prepare next batch transfer
+                current_item = next_item if next_item_ready else self.samples_q[rank].get()
                 # If -1 is received terminate all subprocesses
-                if item == -1:
+                if current_item == -1:
                     break
+                
+                # Start async transfer of next batch while computing current batch
+                if not next_item_ready:
+                    # Try to get next item for pipeline overlap
+                    try:
+                        next_item = self.samples_q[rank].get_nowait()
+                        if next_item != -1:
+                            next_item_ready = True
+                            # Start async H2D transfer for next batch on transfer stream
+                            with torch.cuda.stream(transfer_stream):
+                                with torch.profiler.record_function("pipeline H2D transfer (next batch)"):
+                                    (
+                                        next_id,
+                                        next_seq_embeddings,
+                                        next_payload_features,
+                                        next_max_uih_len,
+                                        next_uih_seq_lengths,
+                                        next_max_num_candidates,
+                                        next_num_candidates,
+                                    ) = next_item
+                                    # Transfer next batch data asynchronously (non-blocking)
+                                    next_num_candidates = next_num_candidates.to(device, non_blocking=True)
+                                    next_uih_seq_lengths = next_uih_seq_lengths.to(device, non_blocking=True)
+                                    next_seq_embeddings = {
+                                        k: SequenceEmbedding(
+                                            lengths=next_seq_embeddings[k].lengths.to(device, non_blocking=True),
+                                            embedding=next_seq_embeddings[k].embedding.to(device, non_blocking=True).to(torch.bfloat16),
+                                        )
+                                        for k in next_seq_embeddings.keys()
+                                    }
+                                    for k, v in next_payload_features.items():
+                                        next_payload_features[k] = v.to(device, non_blocking=True)
+                    except:
+                        # No next item available yet
+                        next_item_ready = False
+                        next_item = None
+                
                 if self.output_trace:
                     assert profiler is not None
                     profiler.step()
+                
                 with torch.profiler.record_function("get_item_from_queue"):
                     # Copy here to release data in the producer to avoid invalid cuda caching allocator release.
-                    item = copy.deepcopy(item)
+                    item = copy.deepcopy(current_item)
                     (
                         id,
                         seq_embeddings,
@@ -443,6 +549,13 @@ class ModelFamilyDenseDist:
                         num_candidates,
                     ) = item
                     assert seq_embeddings is not None
+                
+                # Wait for transfer stream to complete if we're using pre-transferred data
+                if next_item_ready and current_item == next_item:
+                    transfer_stream.synchronize()
+                
+                # Calculate D2H transfer size and perform compute + async D2H
+                t0_compute = time.time()
                 with torch.profiler.record_function("dense forward"):
                     (
                         _,
@@ -459,22 +572,51 @@ class ModelFamilyDenseDist:
                         max_num_candidates=max_num_candidates,
                         num_candidates=num_candidates,
                     )
-                    # mt_target_preds = torch.empty(1, 2048 * 20).to(device="cpu")
-                    # mt_target_labels = None
-                    # mt_target_weights = None
                     assert mt_target_preds is not None
-                    mt_target_preds = mt_target_preds.detach().to(device="cpu")
+                    
+                    # Calculate D2H transfer size
+                    d2h_size = mt_target_preds.numel() * mt_target_preds.element_size()
                     if mt_target_labels is not None:
-                        mt_target_labels = mt_target_labels.detach().to(device="cpu")
+                        d2h_size += mt_target_labels.numel() * mt_target_labels.element_size()
                     if mt_target_weights is not None:
-                        mt_target_weights = mt_target_weights.detach().to(device="cpu")
-                    self.result_q[rank].put(
-                        (id, mt_target_preds, mt_target_labels, mt_target_weights)
-                    )
+                        d2h_size += mt_target_weights.numel() * mt_target_weights.element_size()
+                    
+                    # Use async D2H transfer on transfer stream for pipeline overlap
+                    # This can overlap with next batch's H2D on the same stream
+                    t0_d2h = time.time()
+                    with torch.profiler.record_function("D2H transfer"):
+                        with torch.cuda.stream(transfer_stream):
+                            mt_target_preds = mt_target_preds.detach().to(device="cpu", non_blocking=True)
+                            if mt_target_labels is not None:
+                                mt_target_labels = mt_target_labels.detach().to(device="cpu", non_blocking=True)
+                            if mt_target_weights is not None:
+                                mt_target_weights = mt_target_weights.detach().to(device="cpu", non_blocking=True)
+                
+                # Synchronize compute stream to ensure forward pass is complete
+                torch.cuda.current_stream(device).synchronize()
+                dt_compute = time.time() - t0_compute
+                
+                # Synchronize transfer stream to ensure D2H is complete
+                transfer_stream.synchronize()
+                dt_d2h = time.time() - t0_d2h
+                
+                # Calculate bubble: time when GPU compute is idle
+                # Bubble = compute_time - overlapped_transfer_time
+                # If D2H overlaps with compute, bubble is reduced
+                dt_bubble = max(0.0, dt_compute - dt_d2h) if dt_d2h < dt_compute else 0.0
+                
+                self.result_q[rank].put(
+                    (id, mt_target_preds, mt_target_labels, mt_target_weights, dt_d2h, d2h_size, dt_compute, dt_bubble)
+                )
+                
+                # Update for next iteration
+                if next_item_ready:
+                    current_item = next_item
+                    next_item_ready = False
 
     def capture_output(
         self, id: uuid.UUID, rank: int
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float, int, float, float]:
         """
         Retrieve inference results from a worker process.
 
@@ -483,12 +625,26 @@ class ModelFamilyDenseDist:
             rank: Worker rank to retrieve from.
 
         Returns:
-            Tuple of (predictions, labels, weights).
+            Tuple of (predictions, labels, weights, D2H transfer time, D2H size, compute time, bubble time).
         """
         while True:
-            recv_id, preds, labels, weights = self.result_q[rank].get()
+            result = self.result_q[rank].get()
+            if len(result) == 8:
+                recv_id, preds, labels, weights, dt_d2h, d2h_size, dt_compute, dt_bubble = result
+            elif len(result) == 5:
+                recv_id, preds, labels, weights, dt_d2h = result
+                d2h_size = 0
+                dt_compute = 0.0
+                dt_bubble = 0.0
+            else:
+                # Backward compatibility
+                recv_id, preds, labels, weights = result
+                dt_d2h = 0.0
+                d2h_size = 0
+                dt_compute = 0.0
+                dt_bubble = 0.0
             assert recv_id == id
-            return preds, labels, weights
+            return preds, labels, weights, dt_d2h, d2h_size, dt_compute, dt_bubble
 
     def get_rank(self) -> int:
         """
@@ -510,7 +666,7 @@ class ModelFamilyDenseDist:
         max_num_candidates: int,
         num_candidates: Optional[torch.Tensor],
     ) -> Optional[
-        Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float]
+        Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float, float, float, int, int, float, float]
     ]:
         """
         Run distributed dense forward pass.
@@ -526,7 +682,7 @@ class ModelFamilyDenseDist:
             num_candidates: Per-sample candidate counts.
 
         Returns:
-            Tuple of (predictions, labels, weights, elapsed_time) or None if shutdown.
+            Tuple of (predictions, labels, weights, dense_time, h2d_time, d2h_time, h2d_size, d2h_size, compute_time, bubble_time) or None if shutdown.
         """
         id = uuid.uuid4()
         # If none is received terminate all subprocesses
@@ -542,15 +698,20 @@ class ModelFamilyDenseDist:
             and uih_seq_lengths is not None
         )
         t0: float = time.time()
-        seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
+        # Use async H2D transfer with CUDA stream for pipeline overlap
+        stream = torch.cuda.Stream(device=device)
+        seq_embeddings, payload_features, uih_seq_lengths, num_candidates, dt_h2d, h2d_size = (
             move_sparse_output_to_device(
                 seq_embeddings=seq_embeddings,
                 payload_features=payload_features,
                 uih_seq_lengths=uih_seq_lengths,
                 num_candidates=num_candidates,
                 device=device,
+                stream=stream,
             )
         )
+        # Wait for H2D to complete before putting in queue
+        stream.synchronize()
         self.samples_q[rank].put(
             (
                 id,
@@ -562,7 +723,7 @@ class ModelFamilyDenseDist:
                 num_candidates,
             )
         )
-        (mt_target_preds, mt_target_labels, mt_target_weights) = self.capture_output(
+        (mt_target_preds, mt_target_labels, mt_target_weights, dt_d2h, d2h_size, dt_compute, dt_bubble) = self.capture_output(
             id, rank
         )
         dt_dense = time.time() - t0
@@ -571,6 +732,12 @@ class ModelFamilyDenseDist:
             mt_target_labels,
             mt_target_weights,
             dt_dense,
+            dt_h2d,
+            dt_d2h,
+            h2d_size,
+            d2h_size,
+            dt_compute,
+            dt_bubble,
         )
 
 
@@ -643,6 +810,12 @@ class ModelFamilyDenseSingleWorker:
             Optional[torch.Tensor],
             Optional[torch.Tensor],
             float,
+            float,
+            float,
+            int,
+            int,
+            float,
+            float,
         ]
     ]:
         """
@@ -657,7 +830,7 @@ class ModelFamilyDenseSingleWorker:
             num_candidates: Per-sample candidate counts.
 
         Returns:
-            Tuple of (predictions, labels, weights, elapsed_time).
+            Tuple of (predictions, labels, weights, dense_time, h2d_time, d2h_time, h2d_size, d2h_size, compute_time, bubble_time).
         """
         if self.output_trace:
             assert self.profiler is not None
@@ -670,16 +843,44 @@ class ModelFamilyDenseSingleWorker:
         )
         t0: float = time.time()
         with torch.profiler.record_function("dense forward"):
-            seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
+            # Debug: log before H2D transfer
+            logger.debug(f"[DenseSingleWorker.predict] Before H2D transfer")
+            logger.debug(f"[DenseSingleWorker.predict] uih_seq_lengths: {uih_seq_lengths}, device: {uih_seq_lengths.device}")
+            logger.debug(f"[DenseSingleWorker.predict] num_candidates: {num_candidates}, device: {num_candidates.device}")
+            for k, v in seq_embeddings.items():
+                logger.debug(f"[DenseSingleWorker.predict] seq_embeddings[{k}] before H2D: embedding shape={v.embedding.shape}, device={v.embedding.device}")
+            
+            # Use async H2D transfer with CUDA stream for pipeline overlap
+            h2d_stream = torch.cuda.Stream(device=self.device)
+            seq_embeddings, payload_features, uih_seq_lengths, num_candidates, dt_h2d, h2d_size = (
                 move_sparse_output_to_device(
                     seq_embeddings=seq_embeddings,
                     payload_features=payload_features,
                     uih_seq_lengths=uih_seq_lengths,
                     num_candidates=num_candidates,
                     device=self.device,
+                    stream=h2d_stream,
                 )
             )
+            # Wait for H2D to complete before forward pass
+            h2d_stream.synchronize()
+            
+            # Debug: log after H2D transfer
+            logger.debug(f"[DenseSingleWorker.predict] After H2D transfer")
+            logger.debug(f"[DenseSingleWorker.predict] uih_seq_lengths: {uih_seq_lengths}, device: {uih_seq_lengths.device}")
+            logger.debug(f"[DenseSingleWorker.predict] num_candidates: {num_candidates}, device: {num_candidates.device}")
+            for k, v in seq_embeddings.items():
+                logger.debug(f"[DenseSingleWorker.predict] seq_embeddings[{k}] after H2D: embedding shape={v.embedding.shape}, device={v.embedding.device}")
+            for k, v in payload_features.items():
+                logger.debug(f"[DenseSingleWorker.predict] payload_features[{k}] after H2D: shape={v.shape}, device={v.device}")
+            
+            t0_compute = time.time()
             assert self.model is not None
+            
+            # Debug: log before model forward
+            logger.debug(f"[DenseSingleWorker.predict] Before model.main_forward")
+            logger.debug(f"[DenseSingleWorker.predict] max_uih_len={max_uih_len}, max_num_candidates={max_num_candidates}")
+            
             (
                 _,
                 _,
@@ -695,11 +896,36 @@ class ModelFamilyDenseSingleWorker:
                 max_num_candidates=max_num_candidates,
                 num_candidates=num_candidates,
             )
+            
+            # Debug: log after model forward
+            logger.debug(f"[DenseSingleWorker.predict] After model.main_forward")
+            logger.debug(f"[DenseSingleWorker.predict] mt_target_preds shape: {mt_target_preds.shape if mt_target_preds is not None else None}")
+            
             assert mt_target_preds is not None
-            mt_target_preds = mt_target_preds.detach().to(device="cpu")
+            dt_compute = time.time() - t0_compute
+            
+            # Calculate D2H transfer size
+            d2h_size = mt_target_preds.numel() * mt_target_preds.element_size()
             if mt_target_labels is not None:
-                mt_target_labels = mt_target_labels.detach().to(device="cpu")
+                d2h_size += mt_target_labels.numel() * mt_target_labels.element_size()
             if mt_target_weights is not None:
-                mt_target_weights = mt_target_weights.detach().to(device="cpu")
+                d2h_size += mt_target_weights.numel() * mt_target_weights.element_size()
+            
+            # Use async D2H transfer with CUDA stream for pipeline overlap
+            t0_d2h = time.time()
+            with torch.profiler.record_function("D2H transfer"):
+                d2h_stream = torch.cuda.Stream(device=self.device)
+                with torch.cuda.stream(d2h_stream):
+                    mt_target_preds = mt_target_preds.detach().to(device="cpu", non_blocking=True)
+                    if mt_target_labels is not None:
+                        mt_target_labels = mt_target_labels.detach().to(device="cpu", non_blocking=True)
+                    if mt_target_weights is not None:
+                        mt_target_weights = mt_target_weights.detach().to(device="cpu", non_blocking=True)
+                d2h_stream.synchronize()
+            dt_d2h = time.time() - t0_d2h
+            
+            # Calculate bubble: time when GPU compute is idle
+            dt_bubble = max(0.0, dt_compute - dt_d2h) if dt_d2h < dt_compute else 0.0
+            
             dt_dense: float = time.time() - t0
-            return mt_target_preds, mt_target_labels, mt_target_weights, dt_dense
+            return mt_target_preds, mt_target_labels, mt_target_weights, dt_dense, dt_h2d, dt_d2h, h2d_size, d2h_size, dt_compute, dt_bubble

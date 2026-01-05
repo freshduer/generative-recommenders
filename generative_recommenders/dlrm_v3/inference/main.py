@@ -116,6 +116,7 @@ class Runner:
         compute_eval: bool = False,
     ) -> None:
         self.model = model
+        self._predict_lock = threading.Lock()  # Lock for GPU inference to avoid CUDA conflicts
         if data_producer_threads == 1:
             self.data_producer: Union[
                 MultiThreadDataProducer, SingleThreadDataProducer
@@ -142,6 +143,14 @@ class Runner:
         self.current_t0: List[float] = []
         self.num_queries: int = num_queries
         self.processed_queries: int = 0
+        # Progress tracking
+        self.batch_count: int = 0
+        self.last_log_batch: int = 0
+        self.recent_compute_times: List[float] = []
+        self.recent_sparse_times: List[float] = []
+        self.recent_dense_times: List[float] = []
+        self.recent_h2d_times: List[float] = []
+        self.recent_total_times: List[float] = []
 
     def run_one_item(self, qitem: QueryItem) -> None:
         """
@@ -153,33 +162,111 @@ class Runner:
             qitem: Query item containing batch of samples to process.
         """
         try:
+            logger.debug(f"[Runner.run_one_item] Processing query_ids: {qitem.query_ids}")
+            logger.debug(f"[Runner.run_one_item] Samples uih_features_kjt keys: {qitem.samples.uih_features_kjt.keys()}")
+            logger.debug(f"[Runner.run_one_item] Samples candidates_features_kjt keys: {qitem.samples.candidates_features_kjt.keys()}")
             t0_prediction: float = time.time()
-            prediction_output = self.model.predict(qitem.samples)
+            # Use lock to prevent CUDA conflicts from multiple threads accessing GPU simultaneously
+            with self._predict_lock:
+                prediction_output = self.model.predict(qitem.samples)
+            logger.debug(f"[Runner.run_one_item] Prediction completed successfully")
             dt_prediction: float = time.time() - t0_prediction
             assert prediction_output is not None
-            (
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-                dt_sparse,
-                dt_dense,
-            ) = prediction_output
+            if len(prediction_output) == 11:
+                (
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_sparse,
+                    dt_dense,
+                    dt_h2d,
+                    dt_d2h,
+                    h2d_size,
+                    d2h_size,
+                    dt_compute,
+                    dt_bubble,
+                ) = prediction_output
+            elif len(prediction_output) == 7:
+                # Backward compatibility
+                (
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_sparse,
+                    dt_dense,
+                    dt_h2d,
+                    dt_d2h,
+                ) = prediction_output
+                h2d_size = 0
+                d2h_size = 0
+                dt_compute = 0.0
+                dt_bubble = 0.0
+            else:
+                # Backward compatibility
+                (
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_sparse,
+                    dt_dense,
+                ) = prediction_output
+                dt_h2d = 0.0
+                dt_d2h = 0.0
+                h2d_size = 0
+                d2h_size = 0
+                dt_compute = 0.0
+                dt_bubble = 0.0
             if self.compute_eval:
                 assert mt_target_labels is not None
                 assert mt_target_weights is not None
+            total_time = time.time() - qitem.start
             self.result_timing.append(
                 {
-                    "total": time.time() - qitem.start,
+                    "total": total_time,
                     "prediction": dt_prediction,
                     "queue": qitem.dt_queue,
                     "batching": qitem.dt_batching,
                     "sparse": dt_sparse,
                     "dense": dt_dense,
+                    "h2d": dt_h2d,
+                    "d2h": dt_d2h,
+                    "h2d_size": h2d_size,
+                    "d2h_size": d2h_size,
+                    "compute": dt_compute,
+                    "bubble": dt_bubble,
                 }
             )
             self.result_batches.append(len(qitem.query_ids))
+            
+            # Progress logging every 100 batches
+            self.batch_count += 1
+            self.recent_compute_times.append(dt_compute)
+            self.recent_sparse_times.append(dt_sparse)
+            self.recent_dense_times.append(dt_dense)
+            self.recent_h2d_times.append(dt_h2d)
+            self.recent_total_times.append(total_time)
+            
+            if self.batch_count % 100 == 0:
+                avg_compute = sum(self.recent_compute_times) / len(self.recent_compute_times) * 1000
+                avg_sparse = sum(self.recent_sparse_times) / len(self.recent_sparse_times) * 1000
+                avg_dense = sum(self.recent_dense_times) / len(self.recent_dense_times) * 1000
+                avg_h2d = sum(self.recent_h2d_times) / len(self.recent_h2d_times) * 1000
+                avg_total = sum(self.recent_total_times) / len(self.recent_total_times) * 1000
+                logger.info(
+                    f"[Progress] Batch {self.batch_count}: "
+                    f"avg_compute={avg_compute:.2f}ms, avg_sparse={avg_sparse:.2f}ms, "
+                    f"avg_dense={avg_dense:.2f}ms, avg_h2d={avg_h2d:.2f}ms, avg_total={avg_total:.2f}ms"
+                )
+                # Reset recent times for next 100 batches
+                self.recent_compute_times.clear()
+                self.recent_sparse_times.clear()
+                self.recent_dense_times.clear()
+                self.recent_h2d_times.clear()
+                self.recent_total_times.clear()
         except Exception as ex:  # pylint: disable=broad-except
+            import traceback
             logger.error("thread: failed, %s", ex)
+            logger.error("Full traceback:\n%s", traceback.format_exc())
         finally:
             candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
             if not self.compute_eval:
@@ -307,14 +394,26 @@ def add_results(
     buckets_dict: Dict[str, List[float]] = {}
     buckets_str_dict: Dict[str, str] = {}
     total_timing: list[float] = [result["total"] for result in result_timing]
-    for key in ["total", "prediction", "queue", "batching", "sparse", "dense"]:
-        timing: list[float] = [result[key] for result in result_timing]
-        buckets: List[float] = np.percentile(timing, percentiles).tolist()
-        buckets_str: str = ",".join(
-            ["| {}:{:.4f}| ".format(p, b) for p, b in zip(percentiles, buckets)]
-        )
-        buckets_dict[key] = buckets
-        buckets_str_dict[key] = buckets_str
+    # Time-based metrics
+    for key in ["total", "prediction", "queue", "batching", "sparse", "dense", "h2d", "d2h", "compute", "bubble"]:
+        if result_timing and key in result_timing[0]:
+            timing: list[float] = [result.get(key, 0.0) for result in result_timing]
+            buckets: List[float] = np.percentile(timing, percentiles).tolist()
+            buckets_str: str = ",".join(
+                ["| {}:{:.4f}| ".format(p, b) for p, b in zip(percentiles, buckets)]
+            )
+            buckets_dict[key] = buckets
+            buckets_str_dict[key] = buckets_str
+    # Size-based metrics (in MB)
+    for key in ["h2d_size", "d2h_size"]:
+        if result_timing and key in result_timing[0]:
+            sizes: list[float] = [result.get(key, 0) / (1024 * 1024) for result in result_timing]  # Convert to MB
+            buckets: List[float] = np.percentile(sizes, percentiles).tolist()
+            buckets_str: str = ",".join(
+                ["| {}:{:.2f}MB| ".format(p, b) for p, b in zip(percentiles, buckets)]
+            )
+            buckets_dict[key] = buckets
+            buckets_str_dict[key] = buckets_str
     total_batches = sum(result_batches)
 
     final_results["good"] = len(total_timing)
@@ -338,8 +437,13 @@ def add_results(
             buckets_str_dict["total"],
         )
     )
-    for key in ["prediction", "queue", "batching", "sparse", "dense"]:
+    for key in ["prediction", "queue", "batching", "sparse", "dense", "h2d", "d2h", "compute", "bubble"]:
         logger.warning(f"{key}: {buckets_str_dict[key]}")
+    # Log size information
+    if "h2d_size" in buckets_str_dict:
+        logger.warning(f"h2d_size (MB): {buckets_str_dict['h2d_size']}")
+    if "d2h_size" in buckets_str_dict:
+        logger.warning(f"d2h_size (MB): {buckets_str_dict['d2h_size']}")
 
 
 def get_num_queries(
@@ -663,20 +767,18 @@ def run(
     model_family.load(model_path)
 
     # warmup
-    for autotune_bs in range(batchsize, 0, -1):
-        logger.warning(f"Autotune for batch size {autotune_bs}")
-        warmup_ids = list(range(autotune_bs))
-        ds.load_query_samples(warmup_ids)
-        for _ in range(4 * int(os.environ.get("WORLD_SIZE", 1))):
-            if is_streaming:
-                ds.init_sut()  # pyre-ignore [16]
-            sample: Union[Samples, List[Samples]] = ds.get_samples(warmup_ids)
-            if isinstance(sample, Samples):
-                model_family.predict(sample)
-            else:
-                for s in sample:
-                    model_family.predict(s)
-        ds.unload_query_samples(None)
+    warmup_ids = list(range(batchsize))
+    ds.load_query_samples(warmup_ids)
+    for _ in range(4 * int(os.environ.get("WORLD_SIZE", 1))):
+        if is_streaming:
+            ds.init_sut()  # pyre-ignore [16]
+        sample: Union[Samples, List[Samples]] = ds.get_samples(warmup_ids)
+        if isinstance(sample, Samples):
+            model_family.predict(sample)
+        else:
+            for s in sample:
+                model_family.predict(s)
+    ds.unload_query_samples(None)
     for h in logger.handlers:
         h.flush()
     logger.info("Model forward warmup done")

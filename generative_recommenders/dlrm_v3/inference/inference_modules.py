@@ -20,6 +20,7 @@ This module provides inference-specific components for the HSTU model,
 including sparse inference modules and utilities for moving tensors between devices.
 """
 
+import time
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -36,6 +37,32 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 IS_INFERENCE: bool = True
+
+
+def _calculate_transfer_size(
+    seq_embeddings: Dict[str, SequenceEmbedding],
+    payload_features: Dict[str, torch.Tensor],
+    uih_seq_lengths: torch.Tensor,
+    num_candidates: torch.Tensor,
+) -> int:
+    """Calculate total transfer size in bytes for H2D transfer."""
+    total_size = 0
+    # Size of seq_embeddings
+    for k, v in seq_embeddings.items():
+        if v.embedding.numel() > 0:
+            total_size += v.embedding.numel() * v.embedding.element_size()
+        if v.lengths.numel() > 0:
+            total_size += v.lengths.numel() * v.lengths.element_size()
+    # Size of payload_features
+    for k, v in payload_features.items():
+        if v.numel() > 0:
+            total_size += v.numel() * v.element_size()
+    # Size of uih_seq_lengths and num_candidates
+    if uih_seq_lengths.numel() > 0:
+        total_size += uih_seq_lengths.numel() * uih_seq_lengths.element_size()
+    if num_candidates.numel() > 0:
+        total_size += num_candidates.numel() * num_candidates.element_size()
+    return total_size
 
 
 def set_is_inference(is_inference: bool = False) -> None:
@@ -170,16 +197,19 @@ def move_sparse_output_to_device(
     uih_seq_lengths: torch.Tensor,
     num_candidates: torch.Tensor,
     device: torch.device,
+    stream: Optional[torch.cuda.Stream] = None,
 ) -> Tuple[
     Dict[str, SequenceEmbedding],
     Dict[str, torch.Tensor],
     torch.Tensor,
     torch.Tensor,
+    float,
 ]:
     """
     Move sparse module outputs from CPU to the target device (typically GPU).
 
     Converts embeddings to bfloat16 for efficient GPU computation.
+    Supports asynchronous transfer using CUDA streams for pipeline overlap.
 
     Args:
         seq_embeddings: Dictionary of sequence embeddings to move.
@@ -187,19 +217,40 @@ def move_sparse_output_to_device(
         uih_seq_lengths: UIH sequence lengths tensor to move.
         num_candidates: Number of candidates tensor to move.
         device: Target device (e.g., torch.device('cuda:0')).
+        stream: Optional CUDA stream for asynchronous transfer.
 
     Returns:
-        Tuple of moved tensors on the target device.
+        Tuple of (moved tensors, H2D transfer time in seconds, transfer size in bytes).
     """
-    num_candidates = num_candidates.to(device)
-    uih_seq_lengths = uih_seq_lengths.to(device)
-    seq_embeddings = {
-        k: SequenceEmbedding(
-            lengths=seq_embeddings[k].lengths.to(device),
-            embedding=seq_embeddings[k].embedding.to(device).to(torch.bfloat16),
-        )
-        for k in seq_embeddings.keys()
-    }
-    for k, v in payload_features.items():
-        payload_features[k] = v.to(device)
-    return seq_embeddings, payload_features, uih_seq_lengths, num_candidates
+    transfer_size = _calculate_transfer_size(
+        seq_embeddings, payload_features, uih_seq_lengths, num_candidates
+    )
+    t0_h2d = time.time()
+    with torch.profiler.record_function("H2D transfer"):
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                num_candidates = num_candidates.to(device, non_blocking=True)
+                uih_seq_lengths = uih_seq_lengths.to(device, non_blocking=True)
+                seq_embeddings = {
+                    k: SequenceEmbedding(
+                        lengths=seq_embeddings[k].lengths.to(device, non_blocking=True),
+                        embedding=seq_embeddings[k].embedding.to(device, non_blocking=True).to(torch.bfloat16),
+                    )
+                    for k in seq_embeddings.keys()
+                }
+                for k, v in payload_features.items():
+                    payload_features[k] = v.to(device, non_blocking=True)
+        else:
+            num_candidates = num_candidates.to(device)
+            uih_seq_lengths = uih_seq_lengths.to(device)
+            seq_embeddings = {
+                k: SequenceEmbedding(
+                    lengths=seq_embeddings[k].lengths.to(device),
+                    embedding=seq_embeddings[k].embedding.to(device).to(torch.bfloat16),
+                )
+                for k in seq_embeddings.keys()
+            }
+            for k, v in payload_features.items():
+                payload_features[k] = v.to(device)
+    dt_h2d = time.time() - t0_h2d
+    return seq_embeddings, payload_features, uih_seq_lengths, num_candidates, dt_h2d, transfer_size
