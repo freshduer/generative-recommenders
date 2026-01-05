@@ -8,7 +8,7 @@
 #SBATCH --job-name=InferenceTest
 
 # 指定要使用的分区
-#SBATCH --partition=long
+#SBATCH --partition=short
 
 # 请求的节点数
 #SBATCH --nodes=1
@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:1
 
 # 指定节点列表（node25, 26、node27 或 node28）
-#SBATCH -w gpu24
+#SBATCH -w gpu26
 
 # 请求的 CPU 核心数
 #SBATCH --cpus-per-task=48

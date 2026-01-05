@@ -67,6 +67,7 @@ class HSTUModelFamily:
         output_trace: Whether to enable profiling trace output.
         sparse_quant: Whether to quantize sparse embeddings.
         compute_eval: Whether to compute evaluation metrics (includes labels).
+        enable_overlap_experiment: Whether to enable H2D-compute overlap experiment.
     """
 
     def __init__(
@@ -76,6 +77,7 @@ class HSTUModelFamily:
         output_trace: bool = False,
         sparse_quant: bool = False,
         compute_eval: bool = False,
+        enable_overlap_experiment: bool = False,
     ) -> None:
         self.hstu_config = hstu_config
         self.table_config = table_config
@@ -94,13 +96,20 @@ class HSTUModelFamily:
             if self.world_size > 1
             else ModelFamilyDenseSingleWorker
         )
+        
+        # Prepare kwargs for dense model
+        dense_kwargs = {
+            "hstu_config": hstu_config,
+            "table_config": table_config,
+            "output_trace": output_trace,
+            "compute_eval": compute_eval,
+        }
+        # Only pass overlap experiment flag to single worker (not distributed)
+        if self.world_size == 1 and enable_overlap_experiment:
+            dense_kwargs["enable_overlap_experiment"] = enable_overlap_experiment
+            
         self.dense: Union[ModelFamilyDenseDist, ModelFamilyDenseSingleWorker] = (
-            dense_model_family_clazz(
-                hstu_config=hstu_config,
-                table_config=table_config,
-                output_trace=output_trace,
-                compute_eval=compute_eval,
-            )
+            dense_model_family_clazz(**dense_kwargs)
         )
 
     def version(self) -> str:
@@ -752,6 +761,7 @@ class ModelFamilyDenseSingleWorker:
         table_config: Embedding table configurations.
         output_trace: Whether to enable profiling traces.
         compute_eval: Whether to compute evaluation metrics.
+        enable_overlap_experiment: Whether to enable H2D-compute overlap experiment.
     """
 
     def __init__(
@@ -760,6 +770,7 @@ class ModelFamilyDenseSingleWorker:
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
         compute_eval: bool = False,
+        enable_overlap_experiment: bool = False,
     ) -> None:
         self.model: Optional[torch.nn.Module] = None
         self.hstu_config = hstu_config
@@ -770,6 +781,21 @@ class ModelFamilyDenseSingleWorker:
         self.profiler: Optional[Profiler] = (
             Profiler(rank=0) if self.output_trace else None
         )
+        
+        # Overlap experiment
+        self.enable_overlap_experiment = enable_overlap_experiment
+        self.overlap_experiment = None
+        if enable_overlap_experiment:
+            from generative_recommenders.dlrm_v3.inference.overlap_experiment import OverlapExperiment
+            # Use absolute path to ensure files are saved correctly
+            import os
+            output_dir = os.path.join(os.path.dirname(__file__), "logs-bubble")
+            self.overlap_experiment = OverlapExperiment(
+                device=self.device,
+                output_dir=output_dir,
+                chunk_size_mb=128.0,  # Larger chunks = fewer syncs = less overhead
+                switch_interval=50,
+            )
 
     def load(self, model_path: str) -> None:
         """
@@ -881,28 +907,95 @@ class ModelFamilyDenseSingleWorker:
             logger.debug(f"[DenseSingleWorker.predict] Before model.main_forward")
             logger.debug(f"[DenseSingleWorker.predict] max_uih_len={max_uih_len}, max_num_candidates={max_num_candidates}")
             
-            (
-                _,
-                _,
-                _,
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-            ) = self.model.main_forward(  # pyre-ignore [29]
-                seq_embeddings=seq_embeddings,
-                payload_features=payload_features,
-                max_uih_len=max_uih_len,
-                uih_seq_lengths=uih_seq_lengths,
-                max_num_candidates=max_num_candidates,
-                num_candidates=num_candidates,
-            )
+            # Overlap experiment: run compute with optional H2D overlap simulation
+            h2d_overlapped_time = 0.0
+            bubble_utilization = 0.0
+            
+            if self.overlap_experiment is not None:
+                overlap_enabled = self.overlap_experiment.should_overlap()
+                
+                # Define compute function
+                def compute_fn():
+                    return self.model.main_forward(
+                        seq_embeddings=seq_embeddings,
+                        payload_features=payload_features,
+                        max_uih_len=max_uih_len,
+                        uih_seq_lengths=uih_seq_lengths,
+                        max_num_candidates=max_num_candidates,
+                        num_candidates=num_candidates,
+                    )
+                
+                # Simulate H2D data size - use 10GB to test overlap capacity
+                # 10GB = 10 * 1024 * 1024 * 1024 bytes
+                # With ~12 GB/s bandwidth and ~155ms compute, only ~18% can be transferred
+                simulated_h2d_size = 10 * 1024 * 1024 * 1024  # 10GB
+                
+                if overlap_enabled:
+                    # Run with overlap
+                    result, compute_time_ms, sim_h2d_time_ms, h2d_overlapped_time, bubble_utilization, chunks_completed, total_chunks = (
+                        self.overlap_experiment.run_overlapped_h2d_with_compute(
+                            compute_fn=compute_fn,
+                            compute_args={},
+                            h2d_data_size=simulated_h2d_size,
+                        )
+                    )
+                    dt_compute = compute_time_ms / 1000.0
+                else:
+                    # Run without overlap (baseline)
+                    result, compute_time_ms, sim_h2d_time_ms = (
+                        self.overlap_experiment.run_sequential_h2d_with_compute(
+                            compute_fn=compute_fn,
+                            compute_args={},
+                            h2d_data_size=simulated_h2d_size,
+                        )
+                    )
+                    dt_compute = compute_time_ms / 1000.0
+                    chunks_completed = 0
+                    total_chunks = 0
+                
+                _, _, _, mt_target_preds, mt_target_labels, mt_target_weights = result
+                
+                # Record metrics
+                total_time_ms = (time.time() - t0) * 1000
+                self.overlap_experiment.record_metrics(
+                    overlap_enabled=overlap_enabled,
+                    compute_time_ms=compute_time_ms,
+                    h2d_time_ms=sim_h2d_time_ms,
+                    h2d_overlapped_time_ms=h2d_overlapped_time,
+                    bubble_utilization=bubble_utilization,
+                    total_time_ms=total_time_ms,
+                    h2d_data_size_bytes=simulated_h2d_size,
+                    chunks_completed=chunks_completed,
+                    total_chunks=total_chunks,
+                )
+                
+                # Generate plots if needed
+                if self.overlap_experiment.should_plot():
+                    self.overlap_experiment.generate_plots()
+            else:
+                # Normal execution without overlap experiment
+                (
+                    _,
+                    _,
+                    _,
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                ) = self.model.main_forward(  # pyre-ignore [29]
+                    seq_embeddings=seq_embeddings,
+                    payload_features=payload_features,
+                    max_uih_len=max_uih_len,
+                    uih_seq_lengths=uih_seq_lengths,
+                    max_num_candidates=max_num_candidates,
+                    num_candidates=num_candidates,
+                )
+                dt_compute = time.time() - t0_compute
             
             # Debug: log after model forward
             logger.debug(f"[DenseSingleWorker.predict] After model.main_forward")
             logger.debug(f"[DenseSingleWorker.predict] mt_target_preds shape: {mt_target_preds.shape if mt_target_preds is not None else None}")
             
             assert mt_target_preds is not None
-            dt_compute = time.time() - t0_compute
             
             # Calculate D2H transfer size
             d2h_size = mt_target_preds.numel() * mt_target_preds.element_size()

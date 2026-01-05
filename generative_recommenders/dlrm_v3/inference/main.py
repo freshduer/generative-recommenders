@@ -679,12 +679,13 @@ def run(
     find_peak_performance: bool = False,
     dataset_path_prefix: str = "",
     train_split_percentage: float = 0.75,
-    warmup_ratio: float = 0.1,
+    warmup_ratio: float = 0.01,
     target_qps: Optional[int] = None,
     num_queries: Optional[int] = None,
     numpy_rand_seed: int = 123,
     sparse_quant: bool = False,
     dataset_percentage: float = 1.0,
+    enable_overlap_experiment: bool = False,
 ) -> None:
     """
     Execute the MLPerf DLRMv3 inference benchmark.
@@ -708,6 +709,7 @@ def run(
         numpy_rand_seed: Random seed for reproducibility.
         sparse_quant: Whether to quantize sparse embeddings.
         dataset_percentage: Fraction of dataset to use.
+        enable_overlap_experiment: Whether to enable H2D-compute overlap experiment.
     """
     set_dev_mode(False)
     if scenario_name not in SCENARIO_MAP:
@@ -744,6 +746,7 @@ def run(
         sparse_quant=sparse_quant,
         output_trace=output_trace,
         compute_eval=compute_eval,
+        enable_overlap_experiment=enable_overlap_experiment,
     )
     is_streaming: bool = "streaming" in dataset
     dataset, kwargs = get_dataset(dataset, dataset_path_prefix)

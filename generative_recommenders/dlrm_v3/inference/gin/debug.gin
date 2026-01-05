@@ -1,6 +1,6 @@
 run.model_path = ""
 run.scenario_name = "Server"
-run.batchsize = 16
+run.batchsize = 8
 run.output_trace = False
 run.data_producer_threads = 4
 run.compute_eval = False
@@ -11,3 +11,5 @@ run.train_split_percentage = 0.75
 run.target_qps = 2000
 run.num_queries = 10000
 run.numpy_rand_seed = 123
+
+run.enable_overlap_experiment = True
